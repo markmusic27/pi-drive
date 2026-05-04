@@ -31,7 +31,7 @@ from limits import (
 # Sweep amplitude is clamped to the soft steering limits from limits.py.
 MAX_ANGLE_DEG = min(STEERING_MAX_DEG, -STEERING_MIN_DEG)
 NUM_SWEEPS = 5             # number of full left-right sweeps
-POSITION_THRESHOLD = 0.01  # turns - how close is "arrived"
+POSITION_THRESHOLD = 0.002  # turns - how close is "arrived" (~0.24° at column with 3:1 belt)
 
 # Trajectory planner limits (motor-side units) — these are the MAX for the final sweep
 TRAP_VEL_MAX    = 8.0      # turns/s  — peak cruise speed (sweep 5)
