@@ -1,4 +1,4 @@
-# Cart FSD — Cameras
+# pi-drive — Cameras
 
 The cart has four **UVC-class USB 2.0 cameras** — two front-facing (one narrow, one wide) and one wide on each side. All four are standard UVC devices, so no drivers: macOS uses AVFoundation, Linux uses V4L2, and OpenCV opens both the same way.
 

@@ -1,5 +1,5 @@
 """
-Cart FSD — single source of truth for mechanical/software limits AND for
+pi-drive — single source of truth for mechanical/software limits AND for
 the layered per-mode caps on how much throttle a given controller is
 allowed to command.
 

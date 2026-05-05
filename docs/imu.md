@@ -1,4 +1,4 @@
-# Cart FSD — IMU
+# pi-drive — IMU
 
 The cart's inertial measurement unit is a 9-DoF sensor-fusion module on the Arduino Mega's I2C bus. Right now we're at the **bus-validation stage** — the chip ACKs at its expected I2C address but no orientation data is being read yet. A proper SH-2 driver is on the open-TODO list below.
 
@@ -85,7 +85,7 @@ The whole flow runs from the project root, no Arduino IDE involved. `scripts/upl
 You should see, every ~2 seconds:
 
 ```
-INFO,Cart FSD IMU validation — I2C scanner starting
+INFO,pi-drive IMU validation — I2C scanner starting
 INFO,I2C @ 100000 Hz on Mega SDA=20, SCL=21
 INFO,scanning I2C bus 0x03..0x77...
 FOUND,0x4B,guess=BNO080/BNO085/BNO086 (ADDR=high)

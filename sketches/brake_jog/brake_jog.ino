@@ -1,5 +1,5 @@
 /*
- * Cart FSD — Brake Actuator Jog Test (Arduino Mega 2560)
+ * pi-drive — Brake Actuator Jog Test (Arduino Mega 2560)
  *
  * Bare-minimum diagnostic. Drives the BRAKE BTS7960 H-bridge based on
  * single-character commands typed into the Arduino IDE Serial Monitor.

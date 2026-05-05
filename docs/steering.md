@@ -1,4 +1,4 @@
-# Cart FSD — Steering System
+# pi-drive — Steering System
 
 The steering column is driven by a brushless motor through a belt reduction, closed-loop position-controlled by an ODrive S1. The Jetson AGX Thor talks to the ODrive over USB.
 

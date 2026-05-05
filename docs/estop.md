@@ -1,4 +1,4 @@
-# Cart FSD — E-Stop Subsystems
+# pi-drive — E-Stop Subsystems
 
 The cart has **two independent e-stops**. They exist at different layers and are not interchangeable.
 

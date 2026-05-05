@@ -1,5 +1,5 @@
 [project]
-name = "cart-fsd"
+name = "pi-drive"
 version = "0.1.0"
 description = "Self Driving Golf Cart"
 readme = "README.md"

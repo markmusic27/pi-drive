@@ -1,5 +1,5 @@
 """
-Cart FSD - ODrive S1 Steering Test Script
+pi-drive - ODrive S1 Steering Test Script
 ==========================================
 Controls the M8325s motor via ODrive S1 over USB-C.
 Continuous sweep: 0° → +90° → 0° → -90° → 0°.

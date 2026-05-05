@@ -1,5 +1,5 @@
 /*
- * Cart FSD — Pedal Control Firmware (gas + brake, Arduino Mega 2560)
+ * pi-drive — Pedal Control Firmware (gas + brake, Arduino Mega 2560)
  *
  * Closed-loop-ish (bang-bang with deadband) position control of both the
  * gas and brake linear actuators, plus a host-heartbeat watchdog that
@@ -262,7 +262,7 @@ void setup() {
   // only leave it once the host proves it's alive.
   last_host_byte_ms = millis() - HEARTBEAT_TIMEOUT_MS - 1;
 
-  Serial.println(F("INFO,Cart FSD pedal_control starting"));
+  Serial.println(F("INFO,pi-drive pedal_control starting"));
   Serial.println(F("INFO,protocol: G<f>\\n | B<f>\\n | S\\n | H\\n  (any byte = heartbeat)"));
   Serial.print  (F("INFO,heartbeat timeout = ")); Serial.print(HEARTBEAT_TIMEOUT_MS);
   Serial.println(F(" ms"));

@@ -1,4 +1,4 @@
-# Cart FSD — Pedal Actuators (Gas & Brake)
+# pi-drive — Pedal Actuators (Gas & Brake)
 
 The gas and brake pedals are each pressed by a 12 V linear actuator driven by a BTS7960 H-bridge, commanded by an Arduino Mega 2560. Position feedback comes from a linear potentiometer mechanically coupled to each actuator.
 

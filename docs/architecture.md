@@ -1,4 +1,4 @@
-# Cart FSD — Architecture
+# pi-drive — Architecture
 
 How the cart's software is organized today, where it's going, and the cross-cutting rules (limits hierarchy, safety layers) that every subsystem has to respect.
 
@@ -26,7 +26,7 @@ Power is also layered — 48 V pack → dedicated 12 V and 5 V buck rails — se
 ### Today
 
 ```text
-cart-fsd/
+pi-drive/
 ├── limits.py                      # single source of truth, see below
 ├── main.py                        # ODrive steering sweep test
 ├── scripts/

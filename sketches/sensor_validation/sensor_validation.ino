@@ -1,5 +1,5 @@
 /*
- * Cart FSD Sensor Validation Sketch — GPS only
+ * pi-drive Sensor Validation Sketch — GPS only
  *
  * Forwards GT-U7 GPS (Serial1 @ 9600) to USB Serial @ 115200 so Python can
  * parse NMEA sentences. IMU support is intentionally removed until the
@@ -20,7 +20,7 @@ void setup() {
   Serial.begin(115200);
   Serial1.begin(9600);
   delay(200);
-  Serial.println("INFO,Cart FSD GPS validation sketch starting...");
+  Serial.println("INFO,pi-drive GPS validation sketch starting...");
   Serial.println("INFO,Forwarding GPS (Serial1 @ 9600) -> USB (Serial @ 115200).");
 }
 

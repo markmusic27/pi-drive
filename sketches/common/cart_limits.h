@@ -1,4 +1,4 @@
-// Cart FSD — single source of truth for mechanical / software limits
+// pi-drive — single source of truth for mechanical / software limits
 // (Arduino side). Keep this in sync with ../../limits.py.
 //
 // Include from any sketch that drives an actuator or the steering motor:

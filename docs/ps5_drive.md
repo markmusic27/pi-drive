@@ -1,4 +1,4 @@
-# Cart FSD — PS5 Drive
+# pi-drive — PS5 Drive
 
 Human-driven control of the cart using a **PS5 DualSense** controller, over Bluetooth or USB-C. The script lives at [`scripts/ps5_drive.py`](../scripts/ps5_drive.py) and is the reference "non-autonomy driver" of the cart — the autonomy stack will eventually produce the same commands from the same limits, just with a different input source.
 

@@ -1,4 +1,4 @@
-# Cart FSD — GPS
+# pi-drive — GPS
 
 The cart's GPS is a low-cost u-blox NEO-6M module wired to the Arduino Mega's hardware UART. The Mega forwards NMEA sentences up to the Jetson over USB; for now we're running the **validation-only** passthrough sketch that just forwards raw NMEA to the host computer for inspection.
 
@@ -75,7 +75,7 @@ The whole flow runs from the project root, no Arduino IDE involved. `scripts/upl
 You should see something like:
 
 ```
-[INFO]    Cart FSD GPS validation sketch starting...
+[INFO]    pi-drive GPS validation sketch starting...
 [INFO]    Forwarding GPS (Serial1 @ 9600) -> USB (Serial @ 115200).
 [GPS/GGA] NO FIX     sats= 0 lat=  0.000000 lon=  0.000000 alt=0.0m
 [GPS/GGA] NO FIX     sats= 2 lat=  0.000000 lon=  0.000000 alt=0.0m

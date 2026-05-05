@@ -1,5 +1,5 @@
 /*
- * Cart FSD — IMU I2C Scanner & Validator (Arduino Mega 2560)
+ * pi-drive — IMU I2C Scanner & Validator (Arduino Mega 2560)
  *
  * Walks the I2C bus once every SCAN_INTERVAL_MS and prints every 7-bit
  * address that ACKs. Recognizes the addresses common 9-DoF IMUs default
@@ -76,7 +76,7 @@ void setup() {
   Wire.begin();
   Wire.setClock(I2C_FREQ_HZ);
 
-  Serial.println(F("INFO,Cart FSD IMU validation — I2C scanner starting"));
+  Serial.println(F("INFO,pi-drive IMU validation — I2C scanner starting"));
   Serial.print  (F("INFO,I2C @ "));
   Serial.print  (I2C_FREQ_HZ);
   Serial.println(F(" Hz on Mega SDA=20, SCL=21"));
