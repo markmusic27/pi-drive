@@ -1,6 +1,0 @@
-recordings/*.csv
-recordings/*.png
-__pycache__/
-*.pyc
-.venv/
-.env
