@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Cart Latency Bench</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #181c24;
+      --panel-2: #20242e;
+      --fg: #e8ecf2;
+      --muted: #8a93a6;
+      --accent: #4ade80;
+      --warn: #fbbf24;
+      --err: #f87171;
+      --rec: #ef4444;
+      --border: #2a3140;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      min-height: 100vh;
+    }
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    h1 {
+      font-size: 20px;
+      margin: 0 0 16px;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+    }
+    .row {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      flex: 1 1 280px;
+    }
+    .panel h2 {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+      margin: 0 0 12px;
+      font-weight: 600;
+    }
+    .kv { display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; font-size: 14px; }
+    .kv dt { color: var(--muted); }
+    .kv dd { margin: 0; font-variant-numeric: tabular-nums; }
+    .state {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--muted);
+      box-shadow: 0 0 0 0 currentColor;
+    }
+    .state.connected { color: var(--accent); }
+    .state.connected .dot { background: var(--accent); }
+    .state.connecting, .state.reconnecting { color: var(--warn); }
+    .state.connecting .dot, .state.reconnecting .dot {
+      background: var(--warn);
+      animation: pulse 1s infinite;
+    }
+    .state.disconnected { color: var(--err); }
+    .state.disconnected .dot { background: var(--err); }
+    @keyframes pulse {
+      0%   { box-shadow: 0 0 0 0 currentColor; }
+      70%  { box-shadow: 0 0 0 8px transparent; }
+      100% { box-shadow: 0 0 0 0 transparent; }
+    }
+    .big {
+      font-size: 32px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+    .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; }
+    .controls {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    input[type="text"] {
+      background: var(--panel-2);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 14px;
+      outline: none;
+      width: 100%;
+    }
+    input[type="text"]:focus { border-color: #3b82f6; }
+    button.primary {
+      background: var(--accent);
+      color: #0a0a0a;
+      border: none;
+      border-radius: 12px;
+      padding: 22px;
+      font-size: 22px;
+      font-weight: 700;
+      cursor: pointer;
+      letter-spacing: 0.04em;
+    }
+    button.primary:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    button.primary.rec {
+      background: var(--rec);
+      color: white;
+      animation: blink 1.2s ease-in-out infinite;
+    }
+    @keyframes blink {
+      50% { opacity: 0.7; }
+    }
+    .endpoint {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      color: var(--muted);
+      word-break: break-all;
+    }
+    .files {
+      max-height: 220px;
+      overflow: auto;
+    }
+    .file {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      padding: 6px 0;
+      border-bottom: 1px dashed var(--border);
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .file:last-child { border-bottom: 0; }
+    .file .path { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file .meta { color: var(--muted); white-space: nowrap; }
+    .summary {
+      margin-top: 12px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      display: none;
+    }
+    .err-banner {
+      background: rgba(248, 113, 113, 0.08);
+      border: 1px solid rgba(248, 113, 113, 0.4);
+      color: var(--err);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 12px;
+      margin-top: 8px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Cart Latency Bench</h1>
+
+    <div class="row">
+      <div class="panel" style="flex: 2 1 480px">
+        <h2>Connection</h2>
+        <div class="state" id="state"><span class="dot"></span><span id="state-text">unknown</span></div>
+        <div class="endpoint" id="endpoint" style="margin-top:8px"></div>
+        <div class="endpoint" id="server-info" style="margin-top:4px"></div>
+        <div class="err-banner" id="err-banner"></div>
+        <div class="kv" style="margin-top: 14px">
+          <dt>Payload</dt><dd id="cfg-payload">—</dd>
+          <dt>Rate</dt><dd id="cfg-rate">—</dd>
+          <dt>Timeout</dt><dd id="cfg-timeout">—</dd>
+          <dt>Reconnects</dt><dd id="reconnects">0</dd>
+        </div>
+      </div>
+
+      <div class="panel" style="flex: 1 1 220px">
+        <h2>Live RTT</h2>
+        <div class="big" id="rtt-last">—</div>
+        <div class="label">last</div>
+        <div class="row" style="margin-top: 12px; gap: 18px">
+          <div><div class="big" style="font-size:20px" id="rtt-p50">—</div><div class="label">p50</div></div>
+          <div><div class="big" style="font-size:20px" id="rtt-p99">—</div><div class="label">p99</div></div>
+        </div>
+      </div>
+
+      <div class="panel" style="flex: 1 1 240px">
+        <h2>Live throughput</h2>
+        <div class="row" style="gap: 18px; align-items: baseline">
+          <div>
+            <div class="big" id="up-last" style="color:#60a5fa">—</div>
+            <div class="label">uplink Mbps</div>
+          </div>
+          <div>
+            <div class="big" id="dn-last" style="color:#4ade80">—</div>
+            <div class="label">downlink Mbps</div>
+          </div>
+        </div>
+        <div class="row" style="margin-top: 12px; gap: 18px">
+          <div><div class="big" style="font-size:18px; color:#60a5fa" id="up-p50">—</div><div class="label">up p50</div></div>
+          <div><div class="big" style="font-size:18px; color:#60a5fa" id="up-p90">—</div><div class="label">up p90</div></div>
+          <div><div class="big" style="font-size:18px; color:#4ade80" id="dn-p50">—</div><div class="label">dn p50</div></div>
+          <div><div class="big" style="font-size:18px; color:#4ade80" id="dn-p90">—</div><div class="label">dn p90</div></div>
+        </div>
+      </div>
+
+      <div class="panel" style="flex: 1 1 220px">
+        <h2>Counters</h2>
+        <div class="kv">
+          <dt>Sent</dt><dd id="c-sent">0</dd>
+          <dt>Received</dt><dd id="c-recv">0</dd>
+          <dt>In flight</dt><dd id="c-inflight">0</dd>
+          <dt>Stalls</dt><dd id="c-stalls">0</dd>
+          <dt>Drops</dt><dd id="c-drops">0</dd>
+        </div>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top: 16px">
+      <div class="panel" style="flex: 1 1 380px">
+        <h2>Recording</h2>
+        <div class="controls">
+          <input type="text" id="label" placeholder="run label (e.g. drive_tree_cover_run1)" />
+          <button class="primary" id="rec-btn">Start Recording</button>
+          <div class="endpoint" id="rec-path"></div>
+        </div>
+        <pre class="summary" id="summary"></pre>
+      </div>
+
+      <div class="panel" style="flex: 1 1 380px">
+        <h2>Past recordings</h2>
+        <div class="files" id="files"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let recording = false;
+
+    const fmtMs = (v) => v == null ? "—" : `${v.toFixed(1)} ms`;
+    const fmtMbps = (v) => v == null ? "—" : `${v.toFixed(1)}`;
+    const fmtBytes = (v) => {
+      if (v < 1024) return `${v} B`;
+      if (v < 1024*1024) return `${(v/1024).toFixed(1)} KiB`;
+      return `${(v/1024/1024).toFixed(2)} MiB`;
+    };
+    const fmtTime = (ts) => new Date(ts*1000).toLocaleString();
+
+    async function refreshStatus() {
+      try {
+        const r = await fetch("/api/status");
+        const s = await r.json();
+        const stateEl = $("state");
+        const stateText = $("state-text");
+        stateEl.classList.remove("connected","connecting","reconnecting","disconnected");
+        stateEl.classList.add(s.connection_state);
+        stateText.textContent = s.connection_state;
+        $("endpoint").textContent = s.endpoint;
+        const si = s.server_info || {};
+        if (si.modal_region) {
+          $("server-info").textContent =
+            `landed: ${si.modal_cloud_provider || "?"} / ${si.modal_region} ` +
+            `(requested ${si.requested_region || "?"})`;
+        } else {
+          $("server-info").textContent = "";
+        }
+        $("cfg-payload").textContent = fmtBytes(s.config.payload_size_bytes);
+        $("cfg-rate").textContent = `${s.config.request_rate_hz} Hz`;
+        $("cfg-timeout").textContent = `${s.config.timeout_ms} ms`;
+        $("reconnects").textContent = s.reconnects;
+        $("rtt-last").textContent = fmtMs(s.last_rtt_ms);
+        $("rtt-p50").textContent = fmtMs(s.p50_ms);
+        $("rtt-p99").textContent = fmtMs(s.p99_ms);
+        $("up-last").textContent = fmtMbps(s.last_uplink_mbps);
+        $("up-p50").textContent = fmtMbps(s.uplink_mbps_p50);
+        $("up-p90").textContent = fmtMbps(s.uplink_mbps_p90);
+        $("dn-last").textContent = fmtMbps(s.last_downlink_mbps);
+        $("dn-p50").textContent = fmtMbps(s.downlink_mbps_p50);
+        $("dn-p90").textContent = fmtMbps(s.downlink_mbps_p90);
+        $("c-sent").textContent = s.sent;
+        $("c-recv").textContent = s.received;
+        $("c-inflight").textContent = s.in_flight;
+        $("c-stalls").textContent = s.stalls;
+        $("c-drops").textContent = s.drops;
+
+        const errBanner = $("err-banner");
+        if (s.last_error && s.connection_state !== "connected") {
+          errBanner.textContent = s.last_error;
+          errBanner.style.display = "block";
+        } else {
+          errBanner.style.display = "none";
+        }
+
+        recording = !!(s.recording && s.recording.active);
+        const btn = $("rec-btn");
+        if (recording) {
+          btn.textContent = "Stop Recording";
+          btn.classList.add("rec");
+          $("rec-path").textContent = s.recording.path || "";
+          $("label").value = s.recording.label || $("label").value;
+          $("label").disabled = true;
+        } else {
+          btn.textContent = "Start Recording";
+          btn.classList.remove("rec");
+          $("rec-path").textContent = "";
+          $("label").disabled = false;
+        }
+      } catch (e) {
+        console.warn("status fetch failed", e);
+      }
+    }
+
+    async function refreshFiles() {
+      try {
+        const r = await fetch("/api/recordings");
+        const s = await r.json();
+        const el = $("files");
+        el.innerHTML = "";
+        if (!s.recordings.length) {
+          el.innerHTML = `<div class="file"><span class="meta">No recordings yet.</span></div>`;
+          return;
+        }
+        for (const f of s.recordings) {
+          const div = document.createElement("div");
+          div.className = "file";
+          div.innerHTML = `
+            <span class="path" title="${f.path}">${f.name}</span>
+            <span class="meta">${fmtBytes(f.size_bytes)} · ${fmtTime(f.modified)}</span>
+          `;
+          el.appendChild(div);
+        }
+      } catch (e) {
+        console.warn("files fetch failed", e);
+      }
+    }
+
+    async function toggleRecord() {
+      const btn = $("rec-btn");
+      btn.disabled = true;
+      try {
+        if (!recording) {
+          const label = $("label").value.trim() || "run";
+          const r = await fetch("/api/start", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({label})
+          });
+          if (!r.ok) {
+            const err = await r.json().catch(()=>({detail:"start failed"}));
+            alert(err.detail || "start failed");
+          }
+          $("summary").style.display = "none";
+        } else {
+          const r = await fetch("/api/stop", {method: "POST"});
+          if (!r.ok) {
+            const err = await r.json().catch(()=>({detail:"stop failed"}));
+            alert(err.detail || "stop failed");
+          } else {
+            const body = await r.json();
+            renderSummary(body.summary);
+          }
+          await refreshFiles();
+        }
+      } catch (e) {
+        alert("error: " + e);
+      } finally {
+        btn.disabled = false;
+        await refreshStatus();
+      }
+    }
+
+    function renderSummary(s) {
+      const lines = [
+        `label:           ${s.label}`,
+        `path:            ${s.path}`,
+        `duration:        ${s.duration_s.toFixed(2)} s`,
+        `requests sent:   ${s.total_requests}`,
+        `responses:       ${s.responses}`,
+        `stalls:          ${s.stalls}  (rate=${(s.stall_rate*100).toFixed(2)}%)`,
+        `drops:           ${s.drops}`,
+        `rtt min/p50/p90/p99/max ms:`,
+        `  ${fmtMs(s.rtt_min_ms)} / ${fmtMs(s.rtt_p50_ms)} / ${fmtMs(s.rtt_p90_ms)} / ${fmtMs(s.rtt_p99_ms)} / ${fmtMs(s.rtt_max_ms)}`,
+      ];
+      const el = $("summary");
+      el.textContent = lines.join("\n");
+      el.style.display = "block";
+    }
+
+    $("rec-btn").addEventListener("click", toggleRecord);
+    refreshStatus();
+    refreshFiles();
+    setInterval(refreshStatus, 500);
+    setInterval(refreshFiles, 5000);
+  </script>
+</body>
+</html>
