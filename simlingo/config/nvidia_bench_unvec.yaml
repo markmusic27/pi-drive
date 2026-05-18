@@ -1,0 +1,126 @@
+# Steady-state benchmark config: per-sample (unvectorized) path.
+#
+# Goal: 50 warm optimizer steps with no eval/save interruptions to get
+# a clean per-step time distribution for vec-vs-unvec comparison.
+#
+# Pair: config/nvidia_bench_vec.yaml (identical except training.vectorized: true)
+#
+# Launch:
+#   modal run --detach simlingo/modal_training.py::train_multigpu \
+#     --config-path /app/config/nvidia_bench_unvec.yaml \
+#     --wandb-project simlingo-nvidia-bench
+
+model:
+  base: "RenzKa/simlingo"
+  backbone: "OpenGVLab/InternVL2-1B"
+
+  num_waypoints: 11
+  waypoint_spacing_s: 0.25
+  route_points: 20
+  route_spacing_m: 1.0
+
+training:
+  batch_size: 24
+  gradient_accumulation_steps: 4
+  effective_batch_size: 96
+
+  # ~6 steps/epoch on tiny dataset × 5 epochs = ~30 logged steps,
+  # of which ~5 cold-start + ~25 warm for steady-state averaging.
+  epochs: 5
+  max_steps: null
+
+  learning_rate: 3.0e-5
+  lr_scheduler: cosine
+  warmup_ratio: 0.05
+  warmup_steps: null
+
+  optimizer: adamw
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+  precision: bf16
+  gradient_checkpointing: false
+  max_grad_norm: 1.0
+
+  # Per-sample loop (control)
+  vectorized: false
+
+  # No eval/save during bench - want clean step times
+  eval_steps: 9999
+  save_steps: 9999
+  logging_steps: 1
+
+  early_stopping: false
+  early_stopping_patience: 5
+  early_stopping_metric: val/loss
+
+lora:
+  enabled: true
+  rank: 32
+  alpha: 64
+  dropout: 0.1
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+  vision_lora: false
+  vision_rank: 16
+
+data:
+  train_dir: "/nvidia_data/extracted"
+  val_dir: null
+  val_split: 0.1
+
+  image_size: [448, 448]
+  crop_bottom: false
+
+  fov_deg: 120.0
+  use_intrinsics: true
+
+  augmentation:
+    enabled: false  # Disable for clean step times
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.1
+    hue: 0.05
+
+  num_waypoints: 11
+  waypoint_spacing_s: 0.25
+
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+
+loss:
+  waypoint_loss: smooth_l1
+  waypoint_weight: 1.0
+  route_loss: smooth_l1
+  route_weight: 0.5
+  language_loss: cross_entropy
+  language_weight: 0.0
+
+mdn:
+  enabled: false
+  n_mixtures: 5
+  min_sigma: 0.01
+  input_dim: 896
+
+wandb:
+  project: "simlingo-nvidia-bench"
+  entity: null
+  log_interval: 1
+  save_artifacts: false
+
+hub:
+  push_to_hub: false
+  repo_id: null
+  private: true
+
+distributed:
+  strategy: ddp
+  find_unused_parameters: true
+
+seed: 42

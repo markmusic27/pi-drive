@@ -1235,6 +1235,509 @@ def benchmark_l4(
     return out
 
 
+# -------------------------------------------------------------------------
+# Phase 2 — quantized variants. These are SEPARATE entrypoints; the Phase-1
+# benchmark_l4 / validate_l4 functions above remain untouched and continue
+# to serve as the unquantized reference.
+# -------------------------------------------------------------------------
+
+
+@app.function(
+    image=benchmark_image,
+    volumes=VOLUMES,
+    gpu="L4",
+    timeout=60 * 30,
+    cpu=4,
+    memory=24 * 1024,
+)
+def benchmark_l4_quant(
+    num_iterations: int = 30,
+    num_warmup: int = 5,
+    quantization: str = "int8",
+    quantize_vision: bool = False,
+    quantize_llm: bool = True,
+) -> dict:
+    """Measure achievable Hz with quantization (Phase 1 + Phase 2).
+
+    Args:
+        quantization: "int8" (bnb Linear8bitLt) or "w4a8" (bnb Linear4bit NF4)
+        quantize_vision: quantize InternViT-300M (compute-bound — leave OFF by default;
+            bnb int8 on conv-heavy vision tends to slow down on L4)
+        quantize_llm: quantize Qwen2-0.5B LLM (memory-bound — main FPS win)
+    """
+    import gc
+    import time as _time
+
+    import numpy as np
+    import torch
+
+    sys.path.insert(0, SIMLINGO_REPO_DIR)
+    from simlingo_optimized import OptimizationConfig, OptimizedSimLingo
+
+    config = OptimizationConfig(
+        use_torch_compile=False,  # quantized layers do not compose cleanly with compile
+        use_gpu_preprocessing=True,
+        quantization=quantization,  # type: ignore[arg-type]
+        quantize_vision_encoder=quantize_vision,
+        quantize_language_head=quantize_llm,
+        keep_embedding_fp16=True,
+        enable_streaming=False,
+        waypoints_only=True,
+        verbose=True,
+    )
+
+    ckpt_path = str(Path(CKPT_DIR) / HF_CKPT_FILE)
+    hydra_cfg_path = str(Path(CKPT_DIR) / HF_HYDRA_CONFIG_FILE)
+
+    print("\n" + "=" * 70)
+    print(f"L4 BENCHMARK — waypoints_only + {quantization.upper()} quantization")
+    print(f"GPU: {torch.cuda.get_device_name()}")
+    print(f"quantize_vision={quantize_vision}  quantize_llm={quantize_llm}")
+    print("=" * 70)
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    t_load_start = _time.time()
+    model = OptimizedSimLingo(
+        ckpt_path=ckpt_path,
+        config=config,
+        hydra_cfg_path=hydra_cfg_path,
+        simlingo_repo_path=SIMLINGO_REPO_DIR,
+        cache_dir=f"{CACHE_DIR}/hf/snapshots",
+    )
+    model.load()
+    print(f"Model loaded in {_time.time() - t_load_start:.1f}s", flush=True)
+
+    # Load real CARLA frames (same logic as benchmark_l4)
+    import gzip
+
+    import cv2
+    import ujson
+
+    frames = []
+    n_needed = num_iterations + num_warmup
+    for rgb_dir in Path(EXTRACTED_DIR).rglob("rgb"):
+        meas_dir = rgb_dir.parent / "measurements"
+        if not meas_dir.exists():
+            continue
+        for rgb_file in sorted(rgb_dir.glob("*.jpg"))[: n_needed + 5]:
+            frame_idx = int(rgb_file.stem)
+            meas_file = meas_dir / f"{frame_idx:04d}.json.gz"
+            if not meas_file.exists():
+                continue
+            bgr = cv2.imread(str(rgb_file))
+            if bgr is None:
+                continue
+            img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            with gzip.open(meas_file, "rt") as f:
+                meas = ujson.load(f)
+            tp = meas.get("target_point", [10.0, 0.0])
+            tp_next = meas.get("target_point_next", [20.0, 0.0])
+            frames.append(
+                (
+                    img,
+                    float(meas.get("speed", 5.0)),
+                    np.array([tp, tp_next], dtype=np.float32),
+                )
+            )
+            if len(frames) >= n_needed:
+                break
+        if len(frames) >= n_needed:
+            break
+
+    if not frames:
+        synth = np.random.randint(0, 255, (512, 1024, 3), dtype=np.uint8)
+        frames = [
+            (synth, 5.0, np.array([[10.0, 0.0], [20.0, 0.0]], dtype=np.float32))
+        ] * n_needed
+    print(f"Using {len(frames)} frames", flush=True)
+
+    print(f"\nWarmup ({num_warmup} iters)...", flush=True)
+    for i in range(num_warmup):
+        img, spd, tgt = frames[i]
+        wps, route, _ = model.predict(image=img, speed_mps=spd, target_points=tgt)
+        if i == 0:
+            print(
+                f"  first call OK: wps shape={None if wps is None else wps.shape}, "
+                f"route shape={None if route is None else route.shape}",
+                flush=True,
+            )
+    torch.cuda.synchronize()
+
+    print(f"\nBenchmarking ({num_iterations} iters)...", flush=True)
+    lats_total = []
+    model.reset_timing_stats()
+    for i in range(num_iterations):
+        img, spd, tgt = frames[(num_warmup + i) % len(frames)]
+        torch.cuda.synchronize()
+        t0 = _time.perf_counter()
+        model.predict(image=img, speed_mps=spd, target_points=tgt)
+        torch.cuda.synchronize()
+        lats_total.append((_time.perf_counter() - t0) * 1000.0)
+
+    lats_arr = np.asarray(lats_total)
+    out = {
+        "gpu": torch.cuda.get_device_name(),
+        "quantization": quantization,
+        "quantize_vision": quantize_vision,
+        "quantize_llm": quantize_llm,
+        "num_iterations": num_iterations,
+        "total_ms": {
+            "mean": float(lats_arr.mean()),
+            "p50": float(np.percentile(lats_arr, 50)),
+            "p90": float(np.percentile(lats_arr, 90)),
+            "p99": float(np.percentile(lats_arr, 99)),
+        },
+        "fps_total": float(1000.0 / lats_arr.mean()),
+        "memory_peak_mb": torch.cuda.max_memory_allocated() / (1024 * 1024),
+    }
+
+    print("\n" + "=" * 70)
+    print(f"L4 RESULTS — waypoints_only + {quantization.upper()}")
+    print("=" * 70)
+    print(f"  GPU: {out['gpu']}")
+    print(
+        f"  total: mean={out['total_ms']['mean']:7.1f}ms  "
+        f"p50={out['total_ms']['p50']:7.1f}ms  "
+        f"p90={out['total_ms']['p90']:7.1f}ms"
+    )
+    print(f"  >>> FPS: {out['fps_total']:.2f}")
+    print(f"  GPU mem peak: {out['memory_peak_mb']:.1f} MB")
+    print("=" * 70)
+
+    output_path = Path(OUTPUTS_DIR) / f"benchmark_l4_{quantization}.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(out, f, indent=2)
+    output_volume.commit()
+    return out
+
+
+@app.function(
+    image=benchmark_image,
+    volumes=VOLUMES,
+    gpu="L4",
+    timeout=60 * 60,
+    cpu=4,
+    memory=24 * 1024,
+)
+def validate_l4_quant(
+    num_samples: int = 32,
+    frame_stride: int = 20,
+    quantization: str = "int8",
+    quantize_vision: bool = False,
+    quantize_llm: bool = True,
+    use_cot: bool = True,
+    seed: int = 0,
+) -> dict:
+    """Compare QUANTIZED vs UNQUANTIZED waypoints on identical CARLA frames.
+
+    This is the strict equivalence test: we load two models (one BF16
+    Phase-1, one quantized Phase-1+2), feed both the same image / speed /
+    target_points, and report:
+      - waypoint max-abs-diff between the two predictions (drift introduced
+        purely by quantization)
+      - ADE/FDE of each model vs ground-truth ego-matrix waypoints
+      - latency of each
+
+    If max-abs-diff is small (~< 5 cm) and ADE/FDE doesn't regress, the
+    quantized model is safe to deploy.
+    """
+    import gc
+    import time as _time
+
+    import numpy as np
+    import torch
+
+    sys.path.insert(0, SIMLINGO_REPO_DIR)
+    from simlingo_optimized import OptimizationConfig, OptimizedSimLingo
+
+    base_kwargs = dict(
+        use_torch_compile=False,
+        use_gpu_preprocessing=True,
+        enable_streaming=False,
+        waypoints_only=True,
+        verbose=False,
+    )
+    fp_config = OptimizationConfig(quantization="none", **base_kwargs)
+    q_config = OptimizationConfig(
+        quantization=quantization,  # type: ignore[arg-type]
+        quantize_vision_encoder=quantize_vision,
+        quantize_language_head=quantize_llm,
+        keep_embedding_fp16=True,
+        **base_kwargs,
+    )
+
+    ckpt_path = str(Path(CKPT_DIR) / HF_CKPT_FILE)
+    hydra_cfg_path = str(Path(CKPT_DIR) / HF_HYDRA_CONFIG_FILE)
+
+    print("\n" + "=" * 70)
+    print(f"L4 VALIDATION — BF16 baseline vs {quantization.upper()} quantized")
+    print(f"GPU: {torch.cuda.get_device_name()}")
+    print(
+        f"num_samples={num_samples}  quantize_vision={quantize_vision}  "
+        f"quantize_llm={quantize_llm}"
+    )
+    print("=" * 70)
+
+    import gzip
+
+    import cv2
+    import ujson
+
+    def _ade_fde(pred, gt):
+        if pred is None or gt is None:
+            return float("nan"), float("nan")
+        pred = np.asarray(pred, dtype=np.float64)
+        gt = np.asarray(gt, dtype=np.float64)
+        if pred.shape != gt.shape:
+            n = min(pred.shape[0], gt.shape[0])
+            pred, gt = pred[:n], gt[:n]
+        d = np.linalg.norm(pred - gt, axis=-1)
+        return float(d.mean()), float(d[-1])
+
+    def _compute_waypoints_from_ego_matrix(meas_chain):
+        cur = np.asarray(meas_chain[0], dtype=np.float64)
+        cur_inv = np.linalg.inv(cur)
+        out = []
+        for fut in meas_chain:
+            fut = np.asarray(fut, dtype=np.float64)
+            rel = cur_inv @ fut
+            out.append([rel[0, 3], rel[1, 3]])
+        return np.asarray(out, dtype=np.float32)
+
+    def _equal_spacing_route(pts, num=20, spacing_m=1.0):
+        pts = np.asarray(pts, dtype=np.float64)
+        if pts.shape[0] < 2:
+            return pts.astype(np.float32)
+        dx = np.diff(pts[:, 0])
+        dy = np.diff(pts[:, 1])
+        seg = np.sqrt(dx * dx + dy * dy)
+        cum = np.concatenate([[0.0], np.cumsum(seg)])
+        total = cum[-1]
+        if total < 1e-6:
+            return np.tile(pts[0], (num, 1)).astype(np.float32)
+        targets = np.minimum(np.arange(num) * spacing_m, total)
+        out = np.zeros((num, 2), dtype=np.float32)
+        for i, t in enumerate(targets):
+            idx = int(np.searchsorted(cum, t))
+            idx = min(max(idx, 1), len(cum) - 1)
+            t0, t1 = cum[idx - 1], cum[idx]
+            f = 0.0 if t1 - t0 < 1e-9 else (t - t0) / (t1 - t0)
+            out[i, 0] = pts[idx - 1, 0] + f * (pts[idx, 0] - pts[idx - 1, 0])
+            out[i, 1] = pts[idx - 1, 1] + f * (pts[idx, 1] - pts[idx - 1, 1])
+        return out
+
+    # Collect validation samples once; reuse for both models.
+    rng = np.random.default_rng(seed)
+    NUM_WP = 11
+    WP_STRIDE = 5
+
+    candidates = []
+    for rgb_dir in Path(EXTRACTED_DIR).rglob("rgb"):
+        meas_dir = rgb_dir.parent / "measurements"
+        if not meas_dir.exists():
+            continue
+        rgb_files = sorted(rgb_dir.glob("*.jpg"))
+        if len(rgb_files) < NUM_WP * WP_STRIDE + frame_stride:
+            continue
+        candidates.append((rgb_dir, meas_dir, rgb_files))
+
+    if not candidates:
+        return {"error": "no validation routes found under " + EXTRACTED_DIR}
+
+    samples = []
+    for rgb_dir, meas_dir, rgb_files in candidates:
+        max_start = len(rgb_files) - NUM_WP * WP_STRIDE - 1
+        if max_start <= 0:
+            continue
+        starts = list(range(0, max_start, frame_stride))
+        rng.shuffle(starts)
+        for s in starts:
+            samples.append((rgb_dir, meas_dir, rgb_files, s))
+            if len(samples) >= num_samples:
+                break
+        if len(samples) >= num_samples:
+            break
+
+    print(f"Collected {len(samples)} validation samples", flush=True)
+
+    def _load_meas(meas_dir, idx):
+        p = meas_dir / f"{idx:04d}.json.gz"
+        if not p.exists():
+            return None
+        with gzip.open(p, "rt") as fp:
+            return ujson.load(fp)
+
+    # Pre-decode and pre-compute GT once
+    prepped = []
+    for rgb_dir, meas_dir, rgb_files, s_idx in samples:
+        bgr = cv2.imread(str(rgb_files[s_idx]))
+        if bgr is None:
+            continue
+        img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        frame_idx = int(rgb_files[s_idx].stem)
+        cur_meas = _load_meas(meas_dir, frame_idx)
+        if cur_meas is None or "ego_matrix" not in cur_meas:
+            continue
+        ego_chain = [cur_meas["ego_matrix"]]
+        ok = True
+        for k in range(1, NUM_WP):
+            fut_idx = frame_idx + k * WP_STRIDE
+            fm = _load_meas(meas_dir, fut_idx)
+            if fm is None or "ego_matrix" not in fm:
+                ok = False
+                break
+            ego_chain.append(fm["ego_matrix"])
+        if not ok:
+            continue
+        gt_wps = _compute_waypoints_from_ego_matrix(ego_chain)
+        gt_route = _equal_spacing_route(gt_wps, num=20, spacing_m=1.0)
+        speed = float(cur_meas.get("speed", 0.0))
+        tp = cur_meas.get("target_point", [10.0, 0.0])
+        tp_next = cur_meas.get("target_point_next", tp)
+        targets = np.array([tp, tp_next], dtype=np.float32)
+        prepped.append((img, speed, targets, gt_wps, gt_route))
+
+    print(f"Prepared {len(prepped)} samples with ground-truth", flush=True)
+
+    def run_with_config(label: str, cfg: OptimizationConfig) -> dict:
+        gc.collect()
+        torch.cuda.empty_cache()
+        m = OptimizedSimLingo(
+            ckpt_path=ckpt_path,
+            config=cfg,
+            hydra_cfg_path=hydra_cfg_path,
+            simlingo_repo_path=SIMLINGO_REPO_DIR,
+            cache_dir=f"{CACHE_DIR}/hf/snapshots",
+        )
+        t0 = _time.time()
+        m.load()
+        print(f"[{label}] model loaded in {_time.time() - t0:.1f}s", flush=True)
+
+        # Warmup
+        for img, spd, tgt, _, _ in prepped[:3]:
+            m.predict(image=img, speed_mps=spd, target_points=tgt)
+        torch.cuda.synchronize()
+
+        results = []
+        t_total = 0.0
+        for i, (img, spd, tgt, gt_wps, gt_route) in enumerate(prepped):
+            torch.cuda.synchronize()
+            tic = _time.perf_counter()
+            wps, route, _ = m.predict(
+                image=img, speed_mps=spd, target_points=tgt, use_cot=use_cot
+            )
+            torch.cuda.synchronize()
+            t_total += _time.perf_counter() - tic
+            ade_wp, fde_wp = _ade_fde(wps, gt_wps)
+            ade_rt, fde_rt = _ade_fde(route, gt_route)
+            results.append({
+                "wps": None if wps is None else np.asarray(wps, dtype=np.float32),
+                "route": None if route is None else np.asarray(route, dtype=np.float32),
+                "ade_wp": ade_wp,
+                "fde_wp": fde_wp,
+                "ade_route": ade_rt,
+                "fde_route": fde_rt,
+            })
+            if (i + 1) % 10 == 0:
+                print(
+                    f"  [{label}] {i + 1}/{len(prepped)}  "
+                    f"ADE_wp={ade_wp:.3f}  FDE_wp={fde_wp:.3f}",
+                    flush=True,
+                )
+
+        mem_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        # Free the model before loading the next one
+        del m
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        ade_wp = np.array([r["ade_wp"] for r in results])
+        fde_wp = np.array([r["fde_wp"] for r in results])
+        ade_rt = np.array([r["ade_route"] for r in results])
+        fde_rt = np.array([r["fde_route"] for r in results])
+        return {
+            "label": label,
+            "n_samples": len(results),
+            "wp_ade_mean": float(np.nanmean(ade_wp)),
+            "wp_ade_median": float(np.nanmedian(ade_wp)),
+            "wp_fde_mean": float(np.nanmean(fde_wp)),
+            "route_ade_mean": float(np.nanmean(ade_rt)),
+            "route_fde_mean": float(np.nanmean(fde_rt)),
+            "mean_predict_ms": 1000.0 * t_total / max(len(results), 1),
+            "memory_peak_mb": mem_mb,
+            "per_sample": results,
+        }
+
+    print("\n[A] BF16 baseline (no quantization)", flush=True)
+    res_fp = run_with_config("BF16", fp_config)
+
+    print(f"\n[B] {quantization.upper()} quantized", flush=True)
+    res_q = run_with_config(quantization.upper(), q_config)
+
+    # Drift: per-sample waypoint max-abs-diff between the two models
+    diffs_wp = []
+    diffs_rt = []
+    for a, b in zip(res_fp["per_sample"], res_q["per_sample"]):
+        if a["wps"] is not None and b["wps"] is not None:
+            diffs_wp.append(float(np.max(np.abs(a["wps"] - b["wps"]))))
+        if a["route"] is not None and b["route"] is not None:
+            diffs_rt.append(float(np.max(np.abs(a["route"] - b["route"]))))
+
+    drift = {
+        "wp_max_abs_diff_mean_m": float(np.mean(diffs_wp)) if diffs_wp else float("nan"),
+        "wp_max_abs_diff_p90_m": float(np.percentile(diffs_wp, 90)) if diffs_wp else float("nan"),
+        "wp_max_abs_diff_max_m": float(np.max(diffs_wp)) if diffs_wp else float("nan"),
+        "route_max_abs_diff_mean_m": float(np.mean(diffs_rt)) if diffs_rt else float("nan"),
+    }
+
+    speedup = res_fp["mean_predict_ms"] / max(res_q["mean_predict_ms"], 1e-9)
+
+    print("\n" + "=" * 70)
+    print(f"VALIDATION RESULTS — BF16 vs {quantization.upper()}")
+    print("=" * 70)
+    for res in (res_fp, res_q):
+        print(
+            f"  [{res['label']:<5}] n={res['n_samples']}  "
+            f"wp ADE={res['wp_ade_mean']:.3f} (med {res['wp_ade_median']:.3f})  "
+            f"FDE={res['wp_fde_mean']:.3f}  "
+            f"route ADE={res['route_ade_mean']:.3f}  "
+            f"FDE={res['route_fde_mean']:.3f}  "
+            f"latency={res['mean_predict_ms']:.1f}ms  "
+            f"mem={res['memory_peak_mb']:.0f}MB"
+        )
+    print(
+        f"\n  Drift ({quantization.upper()} vs BF16, per-sample max-abs-diff):"
+    )
+    print(
+        f"    waypoints:  mean={drift['wp_max_abs_diff_mean_m']:.4f} m  "
+        f"p90={drift['wp_max_abs_diff_p90_m']:.4f} m  "
+        f"max={drift['wp_max_abs_diff_max_m']:.4f} m"
+    )
+    print(f"    route:      mean={drift['route_max_abs_diff_mean_m']:.4f} m")
+    print(f"\n  Speedup: {speedup:.2f}x  (BF16 {res_fp['mean_predict_ms']:.1f}ms → "
+          f"{quantization.upper()} {res_q['mean_predict_ms']:.1f}ms)")
+    print("=" * 70)
+
+    # Strip per-sample arrays before JSON dump
+    out = {
+        "bf16": {k: v for k, v in res_fp.items() if k != "per_sample"},
+        "quantized": {k: v for k, v in res_q.items() if k != "per_sample"},
+        "drift": drift,
+        "speedup": speedup,
+        "quantization": quantization,
+    }
+    output_path = Path(OUTPUTS_DIR) / f"validate_l4_{quantization}.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(out, f, indent=2)
+    output_volume.commit()
+    return out
+
+
 @app.function(
     image=benchmark_image,
     volumes=VOLUMES,

@@ -148,24 +148,19 @@ def _quantize_w4a8_bnb(
     failed_count = 0
 
     def _should_quantize(name: str) -> bool:
-        """Determine if a layer should be quantized based on its name."""
-        # Skip embedding layers if requested
+        """Same conservative scoping as the INT8 path: only the actual LLM
+        (and, if explicitly requested, the actual vision encoder excluding
+        the embedded LLM)."""
+        n = name.lower()
         if keep_embedding_fp16:
-            if "embed" in name.lower() or "lm_head" in name.lower():
-                return False
-            if "wte" in name.lower() or "wpe" in name.lower():
-                return False
-            if "head" in name.lower():  # Skip output heads
+            if "embed" in n or "lm_head" in n or "wte" in n or "wpe" in n:
                 return False
 
-        # Check vision/llm flags
-        if "vision" in name.lower() or "vit" in name.lower():
-            return quantize_vision
-        if "language" in name.lower() or "llm" in name.lower() or "lm" in name.lower():
+        if "language_model" in n:
             return quantize_llm
-
-        # Default to LLM quantization for other layers
-        return quantize_llm
+        if quantize_vision and "vision_model" in n and "language_model" not in n:
+            return True
+        return False
 
     def _replace_linear_with_4bit(module: nn.Module, name: str = "") -> nn.Module:
         """Recursively replace Linear layers with 4-bit versions."""
@@ -290,21 +285,34 @@ def _quantize_int8(
     failed_count = 0
 
     def _should_quantize(name: str) -> bool:
-        """Determine if a layer should be quantized based on its name."""
+        """Determine if a Linear layer should be quantized based on its full
+        module path.
+
+        We are deliberately CONSERVATIVE: only the actual LLM
+        (``...language_model...``) and, if explicitly requested, the actual
+        vision encoder (``...vision_model...`` excluding the embedded LLM) are
+        eligible. All driving-specific heads (wp_encoder, adaptors, route
+        head, language head) stay in BF16 — they are tiny, not on the hot
+        path, and quantizing them yields no measurable speedup while risking
+        accuracy regressions.
+        """
+        n = name.lower()
         if keep_embedding_fp16:
-            if "embed" in name.lower() or "lm_head" in name.lower():
-                return False
-            if "wte" in name.lower() or "wpe" in name.lower():
-                return False
-            if "head" in name.lower():
+            if "embed" in n or "lm_head" in n or "wte" in n or "wpe" in n:
                 return False
 
-        if "vision" in name.lower() or "vit" in name.lower():
-            return quantize_vision
-        if "language" in name.lower() or "llm" in name.lower() or "lm" in name.lower():
+        # Actual LLM path inside InternVL2 (e.g. "*.language_model.layers.N.*")
+        if "language_model" in n:
             return quantize_llm
 
-        return quantize_llm
+        # Vision encoder, but EXCLUDE the LLM that lives under vision_model
+        # in some InternVL2 layouts.
+        if quantize_vision and "vision_model" in n and "language_model" not in n:
+            return True
+
+        # Everything else (adaptors, wp_encoder, route head, projection
+        # layers between vision and LLM) -> leave at BF16.
+        return False
 
     def _replace_linear_with_int8(module: nn.Module, name: str = "") -> nn.Module:
         """Recursively replace Linear layers with INT8 versions."""
