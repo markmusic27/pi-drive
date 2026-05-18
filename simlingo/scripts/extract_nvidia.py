@@ -154,16 +154,24 @@ def extract_clip(
     meas_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Load clip data
+        # Load clip data (with streaming enabled)
         video = avdi.get_clip_feature(
             clip_id,
             getattr(avdi.features.CAMERA, camera.upper()),
+            maybe_stream=True,
         )
-        egomotion = avdi.get_clip_feature(clip_id, avdi.features.LABELS.EGOMOTION)
+        egomotion = avdi.get_clip_feature(
+            clip_id,
+            avdi.features.LABELS.EGOMOTION,
+            maybe_stream=True,
+        )
         cam_config = get_camera_config(avdi, clip_id, camera)
 
-        # Create interpolator
-        interpolator = physical_ai_av.utils.interpolation.Interpolator([egomotion])
+        # Create or use interpolator (egomotion may already be Interpolator when streaming)
+        if isinstance(egomotion, physical_ai_av.utils.interpolation.Interpolator):
+            interpolator = egomotion
+        else:
+            interpolator = physical_ai_av.utils.interpolation.Interpolator([egomotion])
 
         # Sample timestamps (avoid last 3s for waypoint horizon)
         max_ts_us = 17_000_000
@@ -360,32 +368,55 @@ def sample_clip_ids_from_api(
     avdi: "physical_ai_av.PhysicalAIAVDatasetInterface",
     num_clips: int,
     seed: int = 42,
+    daytime_only: bool = True,
 ) -> list[str]:
     """Sample clip IDs directly from the API.
 
-    This is a fallback when metadata files aren't available locally.
-    Filters for clips with required features.
+    Uses clip_index to get valid clips, optionally filtered for daytime.
 
     Args:
         avdi: PhysicalAI-AV dataset interface.
         num_clips: Number of clips to sample.
         seed: Random seed.
+        daytime_only: Filter for daytime clips (hours 6-18).
 
     Returns:
         List of clip IDs.
     """
     import random
 
-    # Get all available clips
-    # Note: This may need adjustment based on actual API structure
     try:
-        # Try to get clip list from API
-        all_clips = avdi.list_clips()
+        # Use clip_index to get valid clips
+        clip_index = avdi.clip_index
+        valid_mask = clip_index['clip_is_valid'] == True
+
+        # Filter for daytime if requested
+        if daytime_only and hasattr(avdi, 'data_collection'):
+            try:
+                dc = avdi.data_collection
+                if 'hour_of_day' in dc.columns:
+                    daytime_mask = (dc['hour_of_day'] >= 6) & (dc['hour_of_day'] <= 18)
+                    daytime_clips = set(dc[daytime_mask].index.tolist())
+                    valid_clips = [c for c in clip_index[valid_mask].index.tolist() if c in daytime_clips]
+                    print(f"Filtered to {len(valid_clips)} daytime clips")
+                else:
+                    valid_clips = clip_index[valid_mask].index.tolist()
+            except Exception as e:
+                print(f"Daytime filter failed: {e}, using all valid clips")
+                valid_clips = clip_index[valid_mask].index.tolist()
+        else:
+            valid_clips = clip_index[valid_mask].index.tolist()
+
+        print(f"Found {len(valid_clips)} valid clips")
+
         random.seed(seed)
-        random.shuffle(all_clips)
-        return all_clips[:num_clips]
+        random.shuffle(valid_clips)
+        return valid_clips[:num_clips]
+
     except Exception as e:
-        print(f"Warning: Could not list clips from API: {e}")
+        print(f"Warning: Could not get clips from API: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 

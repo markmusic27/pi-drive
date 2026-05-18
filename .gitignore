@@ -12,3 +12,8 @@ wheels/
 # Local artifacts
 camera_snapshots/
 .DS_Store
+
+# Large media (training/viz outputs)
+*.mp4
+simlingo/special/
+simlingo/waypoint_output/

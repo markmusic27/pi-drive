@@ -18,17 +18,17 @@ model:
   route_spacing_m: 1.0
 
 training:
-  # Batch configuration
-  batch_size: 64
-  gradient_accumulation_steps: 2
-  effective_batch_size: 128  # batch_size * gradient_accumulation_steps
+  # Batch configuration (matching SteerVLA effective batch size)
+  batch_size: 48
+  gradient_accumulation_steps: 4
+  effective_batch_size: 192  # 48 * 4 = 192 (same as SteerVLA)
 
   # Training duration
   epochs: 20
   max_steps: null  # If set, overrides epochs
 
-  # Optimizer settings (lower LR than SimLingo's 3e-5 for fine-tuning)
-  learning_rate: 1.0e-5
+  # Optimizer settings (matching SteerVLA: 3e-5)
+  learning_rate: 3.0e-5
   lr_scheduler: cosine
   warmup_ratio: 0.05
   warmup_steps: null  # If set, overrides warmup_ratio
@@ -40,7 +40,7 @@ training:
 
   # Precision and memory
   precision: bf16
-  gradient_checkpointing: true
+  gradient_checkpointing: false  # Disabled due to LoRA hook compatibility issues
   max_grad_norm: 1.0
 
   # Evaluation
@@ -95,13 +95,14 @@ data:
   waypoint_spacing_s: 0.25
 
   # DataLoader settings
-  num_workers: 4
+  num_workers: 8
   pin_memory: true
-  prefetch_factor: 2
+  prefetch_factor: 4
+  persistent_workers: true
 
 loss:
   # Waypoint loss (primary)
-  waypoint_loss: smooth_l1
+  waypoint_loss: smooth_l1  # or 'mdn' for mixture density network
   waypoint_weight: 1.0
 
   # Route loss
@@ -111,6 +112,13 @@ loss:
   # Language loss (optional, for meta-actions)
   language_loss: cross_entropy
   language_weight: 0.0  # Set to 1.0 when using language labels
+
+# MDN (Mixture Density Network) settings for multimodal waypoint prediction
+mdn:
+  enabled: false  # Set to true to use MDN instead of direct regression
+  n_mixtures: 5   # Number of Gaussian components
+  min_sigma: 0.01 # Minimum std dev to prevent collapse
+  input_dim: 896  # Hidden dim from model (InternVL2-1B uses 896)
 
 wandb:
   project: "simlingo-nvidia-finetune"

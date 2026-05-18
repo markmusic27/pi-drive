@@ -75,50 +75,51 @@ training_image = (
         "ninja-build",
         "libgl1",
         "libglib2.0-0",
+        "ffmpeg",  # For video encoding
     )
-    # PyTorch with CUDA 12.1
+    # PyTorch with CUDA 12.1 (matching SimLingo's tested versions)
     .pip_install(
         "torch==2.2.0",
         "torchvision==0.17.0",
         "torchaudio==2.2.0",
         index_url="https://download.pytorch.org/whl/cu121",
     )
-    # Training dependencies
+    # NVIDIA PhysicalAI-AV SDK first (has strict huggingface-hub requirement)
     .pip_install(
-        "transformers==4.46.3",
-        "tokenizers==0.20.3",
+        "physical_ai_av",
+    )
+    # Training dependencies (versions relaxed to be compatible with physical_ai_av)
+    .pip_install(
+        "transformers==4.44.2",  # Pinned for InternVL2 compatibility
+        "tokenizers>=0.19.0,<0.20",  # Match transformers 4.44 requirement
         "sentencepiece",
-        "peft==0.13.2",
-        "accelerate==1.0.1",
-        "huggingface_hub==0.27.0",
-        "pytorch-lightning==2.4.0",
-        "lightning==2.3.3",
-        "hydra-core==1.3.2",
-        "hydra-zen==0.12.1",
-        "omegaconf==2.3.0",
-        "einops==0.7.0",
-        "timm==0.9.16",
-        "scipy==1.10.1",
-        "scikit-image==0.21.0",
-        "imgaug==0.4.0",
-        "Pillow==10.2.0",
-        "filterpy==1.4.5",
-        "ujson==5.9.0",
-        "matplotlib==3.7.5",
+        "peft>=0.13.0",
+        "accelerate>=1.0.0",
+        "pytorch-lightning>=2.4.0",
+        "lightning>=2.3.0",
+        "hydra-core>=1.3.0",
+        "hydra-zen>=0.12.0",
+        "omegaconf>=2.3.0",
+        "einops>=0.7.0",
+        "timm>=0.9.16",
+        "scipy>=1.10.0",
+        "scikit-image>=0.21.0",
+        "imgaug>=0.4.0",
+        "Pillow>=10.2.0",
+        "filterpy>=1.4.5",
+        "ujson>=5.9.0",
+        "matplotlib>=3.7.0",
         "tqdm",
         "numpy<2",
-        "opencv-python-headless==4.10.0.84",
+        "opencv-python-headless>=4.10.0",
         "line_profiler",
         # W&B for experiment tracking
         "wandb",
-        # NVIDIA PhysicalAI-AV SDK
-        "physical_ai_av",
     )
-    # Flash attention (prebuilt wheel)
-    .pip_install(
-        "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.0.post2/flash_attn-2.7.0.post2+cu12torch2.2cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
-    )
-    .pip_install("deepspeed==0.16.2")
+    # Skip flash-attn for now (takes 20+ min to build, not needed for testing)
+    # For training, uncomment this:
+    # .pip_install("flash-attn", extra_options="--no-build-isolation")
+    .pip_install("deepspeed>=0.16.0")
     # Clone SimLingo repo
     .run_commands(
         f"git clone --depth 1 {SIMLINGO_REPO_URL} {SIMLINGO_REPO_DIR}",
@@ -407,10 +408,10 @@ def train(
 @app.function(
     image=training_image,
     volumes=VOLUMES,
-    gpu="H100:2",  # Multi-GPU for faster training
-    timeout=60 * 60 * 48,  # 48 hours for full training
-    cpu=16,
-    memory=128 * 1024,
+    gpu="H100:4",  # 4x H100 (B200 requires CUDA 12.4+ / PyTorch 2.4+ with sm_100; current image is 12.1)
+    timeout=60 * 60 * 24,  # 24 hours max (Modal limit)
+    cpu=32,
+    memory=256 * 1024,
     secrets=[
         modal.Secret.from_name("huggingface"),
         modal.Secret.from_name("wandb"),
@@ -423,14 +424,14 @@ def train_multigpu(
 ) -> dict:
     """Multi-GPU training with DDP.
 
-    Same as `train` but uses 2x H100 GPUs for faster training on larger datasets.
+    Same as `train` but uses 4x H100 GPUs for fastest training on larger datasets.
     """
     import subprocess
 
     # Use torchrun for DDP
     cmd = [
         "torchrun",
-        "--nproc_per_node=2",
+        "--nproc_per_node=4",
         "--master_port=29500",
         "-m", "scripts.nvidia_trainer",
         "--config", config_path,
@@ -711,56 +712,357 @@ def test_nvidia_connection() -> dict:
 
     token = os.environ.get("HF_TOKEN")
     if not token:
+        print("ERROR: HF_TOKEN not found")
         return {"status": "error", "message": "HF_TOKEN not found"}
 
     print("Initializing NVIDIA PhysicalAI-AV interface...")
+    print(f"physical_ai_av version: {physical_ai_av.__version__}")
+
     try:
         avdi = physical_ai_av.PhysicalAIAVDatasetInterface(token=token)
         print("Connection successful!")
 
-        # Try to list clips
-        print("Listing available clips...")
-        # The actual API may vary - this is a best guess
-        try:
-            clips = avdi.list_clips()
-            clip_count = len(clips) if clips else 0
-            sample_clips = clips[:5] if clips else []
-        except AttributeError:
-            # Try alternative methods
+        # Print available attributes/methods on avdi
+        print(f"AVDI type: {type(avdi)}")
+        print(f"Available features: {dir(avdi.features)}")
+
+        # Try to list clips using different methods
+        print("Attempting to list clips...")
+        clip_count = "unknown"
+        sample_clips = []
+
+        # Method 1: list_clips()
+        if hasattr(avdi, 'list_clips'):
             try:
-                # Some APIs use different methods
-                clips = list(avdi.clips())[:100]
+                clips = avdi.list_clips()
+                clip_count = len(clips) if clips else 0
+                sample_clips = list(clips[:5]) if clips else []
+                print(f"Method list_clips() returned {clip_count} clips")
+            except Exception as e:
+                print(f"list_clips() failed: {e}")
+
+        # Method 2: clips property/method
+        if not sample_clips and hasattr(avdi, 'clips'):
+            try:
+                clips = list(avdi.clips())[:100] if callable(avdi.clips) else list(avdi.clips)[:100]
                 clip_count = len(clips)
                 sample_clips = clips[:5]
-            except Exception:
-                clip_count = "unknown"
-                sample_clips = []
+                print(f"Method clips() returned {clip_count} clips")
+            except Exception as e:
+                print(f"clips() failed: {e}")
 
-        return {
+        # Method 3: get_clip_ids()
+        if not sample_clips and hasattr(avdi, 'get_clip_ids'):
+            try:
+                clips = avdi.get_clip_ids()
+                clip_count = len(clips) if clips else 0
+                sample_clips = list(clips[:5]) if clips else []
+                print(f"Method get_clip_ids() returned {clip_count} clips")
+            except Exception as e:
+                print(f"get_clip_ids() failed: {e}")
+
+        # Method 4: Check metadata
+        if not sample_clips and hasattr(avdi, 'metadata'):
+            try:
+                print(f"Metadata available: {type(avdi.metadata)}")
+            except Exception as e:
+                print(f"metadata access failed: {e}")
+
+        # Method 5: Check features_df
+        if not sample_clips and hasattr(avdi.features, 'features_df'):
+            try:
+                df = avdi.features.features_df
+                print(f"features_df type: {type(df)}")
+                print(f"features_df columns: {list(df.columns) if hasattr(df, 'columns') else 'N/A'}")
+                if hasattr(df, 'columns') and 'clip_id' in df.columns:
+                    clips = df['clip_id'].unique().tolist()
+                    clip_count = len(clips)
+                    sample_clips = clips[:5]
+                    print(f"Found {clip_count} unique clip_ids in features_df")
+            except Exception as e:
+                print(f"features_df access failed: {e}")
+
+        # Method 6: Use clip_index
+        if not sample_clips and hasattr(avdi, 'clip_index'):
+            try:
+                clip_index = avdi.clip_index
+                print(f"clip_index type: {type(clip_index)}")
+                if hasattr(clip_index, 'columns'):
+                    print(f"clip_index columns: {list(clip_index.columns)}")
+                    print(f"clip_index shape: {clip_index.shape}")
+                    # Get clip IDs
+                    if 'clip_id' in clip_index.columns:
+                        clips = clip_index['clip_id'].tolist()
+                    else:
+                        # Try index
+                        clips = clip_index.index.tolist()
+                    clip_count = len(clips)
+                    sample_clips = clips[:10]
+                    print(f"Found {clip_count} clips via clip_index")
+                    print(f"Sample clip IDs: {sample_clips}")
+            except Exception as e:
+                import traceback
+                print(f"clip_index access failed: {e}")
+                print(traceback.format_exc())
+
+        # Method 7: Try data_collection
+        if not sample_clips and hasattr(avdi, 'data_collection'):
+            try:
+                dc = avdi.data_collection
+                print(f"data_collection type: {type(dc)}")
+                if hasattr(dc, 'columns'):
+                    print(f"data_collection columns: {list(dc.columns)}")
+                    print(f"First few rows: {dc.head()}")
+            except Exception as e:
+                print(f"data_collection access failed: {e}")
+
+        print(f"\nResult: {clip_count} clips available")
+        if sample_clips:
+            print(f"Sample clips: {sample_clips}")
+
+        result = {
             "status": "success",
             "clip_count": clip_count,
             "sample_clips": sample_clips,
             "message": "API connection successful",
         }
+        print(f"\nReturning: {result}")
+        return result
 
     except Exception as e:
+        import traceback
+        print(f"ERROR: {e}")
+        print(traceback.format_exc())
         return {
             "status": "error",
             "message": str(e),
+            "traceback": traceback.format_exc(),
         }
 
 
 @app.function(
     image=training_image,
     volumes=VOLUMES,
-    timeout=60 * 30,
+    timeout=60 * 60,  # 1 hour for downloading
     cpu=4,
-    memory=24 * 1024,
+    memory=32 * 1024,  # More memory for video
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def visualize_single_clip(
+    clip_id: str,
+    num_frames: int = 50,
+    fps: int = 5,
+) -> dict:
+    """Visualize a single clip with many frames for detailed review.
+
+    Args:
+        clip_id: NVIDIA clip ID to visualize.
+        num_frames: Number of frames to extract (max ~50 for 20s clip).
+        fps: Video playback FPS.
+
+    Returns:
+        dict with output paths.
+    """
+    import physical_ai_av
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+    import subprocess
+
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        return {"status": "error", "message": "HF_TOKEN not found"}
+
+    print(f"Visualizing clip: {clip_id}")
+    print("Initializing NVIDIA PhysicalAI-AV interface...")
+    avdi = physical_ai_av.PhysicalAIAVDatasetInterface(token=token)
+
+    output_dir = Path(OUTPUTS_DIR) / "single_clip_viz" / clip_id[:20]
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Load clip data
+        camera_feature = avdi.features.CAMERA.CAMERA_FRONT_WIDE_120FOV
+        print("Loading video...")
+        video = avdi.get_clip_feature(clip_id, camera_feature, maybe_stream=True)
+        print("Loading egomotion...")
+        egomotion = avdi.get_clip_feature(clip_id, avdi.features.LABELS.EGOMOTION, maybe_stream=True)
+
+        # Use egomotion as interpolator
+        if isinstance(egomotion, physical_ai_av.utils.interpolation.Interpolator):
+            interpolator = egomotion
+        else:
+            interpolator = physical_ai_av.utils.interpolation.Interpolator([egomotion])
+
+        # Default intrinsics for 120° FOV
+        K = np.array([
+            [554, 0, 960],
+            [0, 554, 540],
+            [0, 0, 1]
+        ], dtype=np.float32)
+
+        # Sample timestamps across full clip (leave 3s at end for waypoint horizon)
+        max_ts_us = 17_000_000  # 17 seconds
+        timestamps_us = np.linspace(0, max_ts_us, num_frames).astype(int)
+
+        print(f"Decoding {num_frames} frames across {max_ts_us/1e6:.1f}s...")
+        frames, actual_ts = video.decode_images_from_timestamps(timestamps_us)
+
+        saved_frames = []
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+        cam_height = 1.5
+
+        for i, (frame, ts_us) in enumerate(zip(frames, actual_ts)):
+            current_state = interpolator(ts_us)
+            current_pose = current_state.pose
+
+            # Get rotation matrix
+            if hasattr(current_pose, 'rotation'):
+                try:
+                    if hasattr(current_pose.rotation, 'as_matrix'):
+                        R_current = current_pose.rotation.as_matrix()
+                    elif hasattr(current_pose.rotation, 'R'):
+                        R_current = current_pose.rotation.R
+                    else:
+                        R_current = np.array(current_pose.rotation).reshape(3, 3)
+                except Exception:
+                    R_current = np.eye(3)
+            else:
+                R_current = np.eye(3)
+
+            current_trans = np.array(current_pose.translation)
+
+            # Compute waypoints
+            waypoints = []
+            for j in range(1, 12):
+                future_us = ts_us + int(j * 0.25 * 1_000_000)
+                try:
+                    future_state = interpolator(future_us)
+                    future_pose = future_state.pose
+                    future_trans = np.array(future_pose.translation)
+                    diff = future_trans - current_trans
+                    relative_pos = R_current.T @ diff
+                    waypoints.append([float(relative_pos[0]), float(relative_pos[1])])
+                except Exception:
+                    if waypoints:
+                        waypoints.append(waypoints[-1])
+                    else:
+                        waypoints.append([0.0, 0.0])
+
+            waypoints = np.array(waypoints, dtype=np.float32)
+
+            # Get speed
+            try:
+                speed_mps = float(np.linalg.norm(current_state.velocity[:2]))
+            except Exception:
+                speed_mps = 0.0
+
+            # Create visualization
+            h, w = frame.shape[:2]
+            pil_img = Image.fromarray(frame)
+            draw = ImageDraw.Draw(pil_img)
+
+            # Project waypoints
+            pixels = []
+            for x_fwd, y_left in waypoints:
+                if x_fwd > 0.5:
+                    cam_x = -y_left
+                    cam_y = cam_height
+                    cam_z = x_fwd
+                    u = fx * cam_x / cam_z + cx
+                    v = fy * cam_y / cam_z + cy
+                    if 0 <= u < w and 0 <= v < h:
+                        pixels.append((int(u), int(v)))
+
+            # Draw waypoints
+            for j, (u, v) in enumerate(pixels):
+                progress = j / max(len(waypoints) - 1, 1)
+                r = int(255 * progress)
+                g = int(255 * (1 - progress))
+                radius = 8
+                draw.ellipse(
+                    (u - radius, v - radius, u + radius, v + radius),
+                    fill=(r, g, 0), outline=(255, 255, 255), width=2,
+                )
+                if j > 0:
+                    prev_u, prev_v = pixels[j - 1]
+                    draw.line([(prev_u, prev_v), (u, v)], fill=(r, g, 0), width=3)
+
+            # Add info overlay
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
+            except Exception:
+                font = ImageFont.load_default()
+
+            pil_img = pil_img.convert("RGBA")
+            overlay = Image.new("RGBA", (w, 80), (0, 0, 0, 200))
+            pil_img.paste(overlay, (0, 0), overlay)
+            pil_img = pil_img.convert("RGB")
+            draw = ImageDraw.Draw(pil_img)
+
+            info_text = (
+                f"Clip: {clip_id[:30]}...\n"
+                f"Frame {i+1}/{num_frames} | Time: {ts_us/1e6:.2f}s | "
+                f"Speed: {speed_mps:.1f} m/s ({speed_mps*2.237:.1f} mph) | "
+                f"Waypoints: {len(pixels)}/11"
+            )
+            draw.text((10, 8), info_text, fill=(255, 255, 255), font=font)
+
+            # Save frame
+            frame_path = output_dir / f"frame_{i:04d}.png"
+            pil_img.save(frame_path)
+            saved_frames.append(str(frame_path))
+
+            if i % 10 == 0:
+                print(f"  Frame {i+1}/{num_frames}: speed={speed_mps:.1f} m/s, waypoints={len(pixels)}/11")
+
+        # Create video with ffmpeg
+        video_path = output_dir / "full_clip.mp4"
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-framerate", str(fps),
+            "-i", str(output_dir / "frame_%04d.png"),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+            str(video_path),
+        ]
+        subprocess.run(ffmpeg_cmd, capture_output=True)
+
+        print(f"\nVisualization complete!")
+        print(f"Output: {output_dir}")
+        print(f"Video: {video_path} ({num_frames} frames @ {fps} fps = {num_frames/fps:.1f}s)")
+
+        output_volume.commit()
+
+        return {
+            "status": "success",
+            "clip_id": clip_id,
+            "output_dir": str(output_dir),
+            "video_path": str(video_path),
+            "num_frames": num_frames,
+            "duration_s": num_frames / fps,
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            "status": "error",
+            "clip_id": clip_id,
+            "message": str(e),
+            "traceback": traceback.format_exc(),
+        }
+
+
+@app.function(
+    image=training_image,
+    volumes=VOLUMES,
+    timeout=60 * 60,  # 1 hour for downloading
+    cpu=4,
+    memory=32 * 1024,  # More memory for video
     secrets=[modal.Secret.from_name("huggingface")],
 )
 def test_waypoint_visualization(
     clip_id: str | None = None,
-    num_frames: int = 10,
+    num_frames: int = 20,
 ) -> dict:
     """Quick test: extract a few frames from one clip and visualize waypoints.
 
@@ -786,13 +1088,21 @@ def test_waypoint_visualization(
 
     # Get a clip ID if not provided
     if clip_id is None:
-        print("No clip_id provided, fetching first available clip...")
+        print("No clip_id provided, fetching first valid clip...")
         try:
-            clips = avdi.list_clips()
-            if not clips:
-                clips = list(avdi.clips())[:1]
-            clip_id = clips[0] if clips else None
+            # Use clip_index to get valid clips
+            clip_index = avdi.clip_index
+            valid_clips = clip_index[clip_index['clip_is_valid'] == True].index.tolist()
+            if valid_clips:
+                clip_id = valid_clips[0]
+                print(f"Selected clip: {clip_id}")
+            else:
+                clip_id = clip_index.index[0]
+                print(f"No valid clips found, using first clip: {clip_id}")
         except Exception as e:
+            import traceback
+            print(f"Could not get clip: {e}")
+            print(traceback.format_exc())
             return {"status": "error", "message": f"Could not list clips: {e}"}
 
     if clip_id is None:
@@ -807,26 +1117,115 @@ def test_waypoint_visualization(
     try:
         # Load clip data
         print("Loading video data...")
-        camera_feature = avdi.features.CAMERA.CAMERA_FRONT_WIDE_120FOV
-        video = avdi.get_clip_feature(clip_id, camera_feature)
+        print(f"Available camera features: {dir(avdi.features.CAMERA)}")
+        try:
+            camera_feature = avdi.features.CAMERA.CAMERA_FRONT_WIDE_120FOV
+            print(f"Camera feature: {camera_feature}")
+        except AttributeError as e:
+            print(f"CAMERA_FRONT_WIDE_120FOV not found, trying alternatives...")
+            print(f"Camera options: {[x for x in dir(avdi.features.CAMERA) if not x.startswith('_')]}")
+            # Try to get first available camera
+            camera_attrs = [x for x in dir(avdi.features.CAMERA) if not x.startswith('_') and 'FRONT' in x]
+            if camera_attrs:
+                camera_feature = getattr(avdi.features.CAMERA, camera_attrs[0])
+                print(f"Using camera: {camera_attrs[0]}")
+            else:
+                raise ValueError("No front camera found")
+
+        print(f"Calling get_clip_feature for video...")
+        print("This may take a minute to stream from HuggingFace...")
+        import sys
+        sys.stdout.flush()
+        try:
+            # Use maybe_stream=True to stream from HF Hub without full download
+            video = avdi.get_clip_feature(clip_id, camera_feature, maybe_stream=True)
+            print(f"Video loaded: {type(video)}")
+        except Exception as e:
+            import traceback
+            print(f"ERROR loading video: {e}")
+            print(traceback.format_exc())
+            return {"status": "error", "message": f"Failed to load video: {e}"}
 
         print("Loading egomotion data...")
-        egomotion = avdi.get_clip_feature(clip_id, avdi.features.LABELS.EGOMOTION)
+        print(f"Available label features: {[x for x in dir(avdi.features.LABELS) if not x.startswith('_')]}")
+        try:
+            egomotion = avdi.get_clip_feature(clip_id, avdi.features.LABELS.EGOMOTION, maybe_stream=True)
+            print(f"Egomotion loaded: {type(egomotion)}")
+        except Exception as e:
+            import traceback
+            print(f"ERROR loading egomotion: {e}")
+            print(traceback.format_exc())
+            return {"status": "error", "message": f"Failed to load egomotion: {e}"}
 
         print("Loading calibration...")
-        intrinsics_data = avdi.get_clip_feature(
-            clip_id, avdi.features.CALIBRATION.CAMERA_INTRINSICS
-        )
-        K = intrinsics_data.get_camera_matrix("camera_front_wide_120fov")
+        try:
+            intrinsics_data = avdi.get_clip_feature(
+                clip_id, avdi.features.CALIBRATION.CAMERA_INTRINSICS, maybe_stream=True
+            )
+            print(f"Intrinsics data type: {type(intrinsics_data)}")
+            print(f"Intrinsics attributes: {[x for x in dir(intrinsics_data) if not x.startswith('_')]}")
 
-        # Create interpolator
-        interpolator = physical_ai_av.utils.interpolation.Interpolator([egomotion])
+            # Explore camera_models attribute
+            if hasattr(intrinsics_data, 'camera_models'):
+                camera_models = intrinsics_data.camera_models
+                print(f"camera_models type: {type(camera_models)}")
+                print(f"camera_models: {camera_models}")
+                # Try to extract intrinsics from camera_models
+                if isinstance(camera_models, dict):
+                    for cam_name, model in camera_models.items():
+                        print(f"  {cam_name}: {type(model)}, attrs: {[x for x in dir(model) if not x.startswith('_')][:10]}")
+                        if 'front_wide' in cam_name.lower():
+                            if hasattr(model, 'fx'):
+                                K = np.array([
+                                    [model.fx, 0, model.cx],
+                                    [0, model.fy, model.cy],
+                                    [0, 0, 1]
+                                ], dtype=np.float32)
+                                print(f"Found intrinsics from {cam_name}: fx={model.fx}, fy={model.fy}")
+                                break
+                            elif hasattr(model, 'K'):
+                                K = np.array(model.K, dtype=np.float32)
+                                print(f"Found K matrix from {cam_name}")
+                                break
 
-        # Sample timestamps
-        max_ts_us = 17_000_000  # 17 seconds
+            # If we still don't have K, use defaults for 120° FOV
+            if 'K' not in dir() or K is None:
+                # 120° FOV on 1920x1080: fx = 1920 / (2 * tan(60°)) ≈ 554
+                K = np.array([
+                    [554, 0, 960],
+                    [0, 554, 540],
+                    [0, 0, 1]
+                ], dtype=np.float32)
+                print(f"Using default 120° FOV intrinsics")
+
+            print(f"Final K: {K}")
+        except Exception as e:
+            import traceback
+            print(f"ERROR loading calibration: {e}")
+            print(traceback.format_exc())
+            K = np.array([
+                [554, 0, 960],
+                [0, 554, 540],
+                [0, 0, 1]
+            ], dtype=np.float32)
+            print(f"Using default intrinsics: {K}")
+
+        # egomotion is already an Interpolator in newer API versions
+        if isinstance(egomotion, physical_ai_av.utils.interpolation.Interpolator):
+            interpolator = egomotion
+            print("Egomotion is already an Interpolator")
+        else:
+            interpolator = physical_ai_av.utils.interpolation.Interpolator([egomotion])
+            print("Created Interpolator from egomotion data")
+
+        # Sample timestamps - leave 3s at end for waypoint horizon
+        # Clips are ~20s, so sample from 0-14s to ensure full waypoint coverage
+        max_ts_us = 14_000_000  # 14 seconds (leaves 6s for 2.75s waypoint horizon + buffer)
         timestamps_us = np.linspace(0, max_ts_us, num_frames).astype(int)
+        print(f"Sampling {num_frames} timestamps from 0 to {max_ts_us/1e6:.1f}s")
 
-        print(f"Decoding {num_frames} frames...")
+        print(f"Decoding {num_frames} frames from video...")
+        sys.stdout.flush()
         frames, actual_ts = video.decode_images_from_timestamps(timestamps_us)
 
         print("Generating visualizations with waypoints...")
@@ -839,15 +1238,44 @@ def test_waypoint_visualization(
 
             # Compute waypoints (11 points, 0.25s spacing)
             waypoints = []
+
+            # Debug: print interpolator info on first frame
+            if i == 0:
+                print(f"Interpolator type: {type(interpolator)}")
+                print(f"Current state: {type(current_state)}")
+                print(f"Current pose: {type(current_pose)}")
+                print(f"Current pose attrs: {[x for x in dir(current_pose) if not x.startswith('_')][:10]}")
+                if hasattr(current_pose, 'translation'):
+                    print(f"Current translation: {current_pose.translation}")
+                if hasattr(current_pose, 'rotation'):
+                    print(f"Current rotation: {current_pose.rotation}")
+
             for j in range(1, 12):
                 future_us = ts_us + int(j * 0.25 * 1_000_000)
                 try:
                     future_state = interpolator(future_us)
-                    relative_pos = current_pose.inverse().apply(
-                        future_state.pose.translation
-                    )
-                    waypoints.append([relative_pos[0], relative_pos[1]])
-                except Exception:
+                    future_pose = future_state.pose
+
+                    if i == 0 and j == 1:
+                        print(f"Future pose (j=1): translation={future_pose.translation}")
+
+                    # Get relative position: transform future to current frame
+                    if hasattr(current_pose, 'inverse'):
+                        relative_pos = current_pose.inverse().apply(future_pose.translation)
+                    else:
+                        # Manual calculation if inverse() not available
+                        diff = future_pose.translation - current_pose.translation
+                        # Rotate by inverse of current rotation
+                        # For now, just use the diff directly (assuming small rotation)
+                        relative_pos = diff
+
+                    if i == 0 and j <= 3:
+                        print(f"  wp{j}: relative_pos={relative_pos}")
+
+                    waypoints.append([float(relative_pos[0]), float(relative_pos[1])])
+                except Exception as e:
+                    if i == 0:
+                        print(f"  wp{j} error: {e}")
                     if waypoints:
                         waypoints.append(waypoints[-1])
                     else:
@@ -871,14 +1299,37 @@ def test_waypoint_visualization(
             # Simple pinhole projection
             fx, fy = K[0, 0], K[1, 1]
             cx, cy = K[0, 2], K[1, 2]
-            cam_height = 1.5  # Approximate camera height
+            cam_height = 1.5  # Approximate camera height above ground
+
+            # Debug: print first frame's waypoints
+            if i == 0:
+                print(f"Frame 0 waypoints (x_fwd, y_left):")
+                for j, (x_fwd, y_left) in enumerate(waypoints):
+                    print(f"  wp{j}: x_fwd={x_fwd:.2f}m, y_left={y_left:.2f}m")
+                print(f"Camera: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
+                print(f"Image size: {w}x{h}")
 
             pixels = []
             for x_fwd, y_left in waypoints:
-                if x_fwd > 0.1:  # In front of camera
-                    # Project to image
-                    u = cx - (y_left * fx) / x_fwd
-                    v = cy + (cam_height * fy) / x_fwd
+                if x_fwd > 0.5:  # In front of camera (at least 0.5m)
+                    # Project ground point to image
+                    # Camera frame: X_right, Y_down, Z_forward
+                    # Ego frame: X_forward, Y_left, Z_up
+                    # Ground point in ego: (x_fwd, y_left, 0)
+                    # Camera is at height cam_height looking forward
+                    # In camera frame: X = -y_left, Y = cam_height, Z = x_fwd
+                    cam_x = -y_left
+                    cam_y = cam_height  # camera height above ground
+                    cam_z = x_fwd
+
+                    # Project: u = fx * cam_x / cam_z + cx
+                    #          v = fy * cam_y / cam_z + cy
+                    u = fx * cam_x / cam_z + cx
+                    v = fy * cam_y / cam_z + cy
+
+                    if i == 0 and len(pixels) < 3:
+                        print(f"  Proj: ({x_fwd:.1f}, {y_left:.1f}) -> ({u:.0f}, {v:.0f})")
+
                     if 0 <= u < w and 0 <= v < h:
                         pixels.append((int(u), int(v)))
 
@@ -907,9 +1358,12 @@ def test_waypoint_visualization(
             except Exception:
                 font = ImageFont.load_default()
 
-            # Semi-transparent background
+            # Semi-transparent background - convert to RGBA first
+            pil_img = pil_img.convert("RGBA")
             overlay = Image.new("RGBA", (w, 100), (0, 0, 0, 200))
             pil_img.paste(overlay, (0, 0), overlay)
+            # Convert back to RGB for saving
+            pil_img = pil_img.convert("RGB")
 
             info_text = (
                 f"Clip: {clip_id[:30]}...\n"
@@ -924,20 +1378,55 @@ def test_waypoint_visualization(
             frame_path = output_dir / f"frame_{i:04d}.png"
             pil_img.save(frame_path)
             saved_frames.append(str(frame_path))
-            print(f"  Saved frame {i+1}: speed={speed_mps:.1f} m/s, "
-                  f"waypoints visible={len(pixels)}/11")
 
-        # Create video
-        import cv2
+            # Debug: print more info if few waypoints visible
+            if len(pixels) < 5:
+                print(f"  Frame {i+1}: speed={speed_mps:.1f} m/s, "
+                      f"waypoints visible={len(pixels)}/11, "
+                      f"t={ts_us/1e6:.2f}s")
+                if len(waypoints) > 0:
+                    print(f"    First wp: x={waypoints[0][0]:.1f}m, last wp: x={waypoints[-1][0]:.1f}m")
+            else:
+                print(f"  Saved frame {i+1}: speed={speed_mps:.1f} m/s, "
+                      f"waypoints visible={len(pixels)}/11")
 
+        # Create video using ffmpeg for better compatibility
         video_path = output_dir / "waypoint_test.mp4"
-        first = cv2.imread(saved_frames[0])
-        h, w = first.shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(video_path), fourcc, 2.0, (w, h))
-        for fp in saved_frames:
-            writer.write(cv2.imread(fp))
-        writer.release()
+        import subprocess
+
+        # Use ffmpeg for reliable video encoding
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",  # Overwrite output
+            "-framerate", "2",  # 2 fps for slow viewing
+            "-i", str(output_dir / "frame_%04d.png"),
+            "-c:v", "libx264",  # H.264 codec for compatibility
+            "-pix_fmt", "yuv420p",  # Required for most players
+            "-crf", "18",  # High quality
+            str(video_path),
+        ]
+        try:
+            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"ffmpeg warning: {result.stderr}")
+                # Fallback to OpenCV
+                import cv2
+                first = cv2.imread(saved_frames[0])
+                h, w = first.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(str(video_path), fourcc, 2.0, (w, h))
+                for fp in saved_frames:
+                    writer.write(cv2.imread(fp))
+                writer.release()
+        except FileNotFoundError:
+            # ffmpeg not available, use OpenCV
+            import cv2
+            first = cv2.imread(saved_frames[0])
+            h, w = first.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(video_path), fourcc, 2.0, (w, h))
+            for fp in saved_frames:
+                writer.write(cv2.imread(fp))
+            writer.release()
 
         print(f"\nVisualization complete!")
         print(f"Output directory: {output_dir}")
@@ -962,6 +1451,332 @@ def test_waypoint_visualization(
             "message": str(e),
             "traceback": traceback.format_exc(),
         }
+
+
+@app.function(
+    image=training_image,
+    volumes=VOLUMES,
+    timeout=60 * 60 * 2,  # 2 hours for multiple clips
+    cpu=4,
+    memory=32 * 1024,
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def test_multiple_clips(
+    num_clips: int = 3,
+    num_frames_per_clip: int = 10,
+    daytime_only: bool = True,
+    min_speed_mps: float = 3.0,
+) -> dict:
+    """Test waypoint visualization on multiple random clips.
+
+    Args:
+        num_clips: Number of random clips to test.
+        num_frames_per_clip: Frames per clip.
+        daytime_only: If True, only use daytime clips.
+        min_speed_mps: Minimum average speed to filter clips (avoids stopped cars).
+
+    Returns:
+        Summary with paths to all outputs.
+    """
+    import physical_ai_av
+    import numpy as np
+    import random
+    from PIL import Image, ImageDraw, ImageFont
+    import subprocess
+
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        return {"status": "error", "message": "HF_TOKEN not found"}
+
+    print("Initializing NVIDIA PhysicalAI-AV interface...")
+    avdi = physical_ai_av.PhysicalAIAVDatasetInterface(token=token)
+
+    # Get filtered clip IDs
+    try:
+        clip_index = avdi.clip_index
+        print(f"Total clips in index: {len(clip_index)}")
+        print(f"Clip index columns: {list(clip_index.columns)}")
+
+        # Start with valid clips
+        valid_mask = clip_index['clip_is_valid'] == True
+        print(f"Valid clips: {valid_mask.sum()}")
+
+        # Filter for daytime if requested
+        if daytime_only and 'time_of_day' in clip_index.columns:
+            daytime_mask = clip_index['time_of_day'] == 'day'
+            valid_mask = valid_mask & daytime_mask
+            print(f"Daytime clips: {valid_mask.sum()}")
+        elif daytime_only:
+            print("'time_of_day' not in clip_index, checking data_collection metadata...")
+            try:
+                if hasattr(avdi, 'data_collection'):
+                    dc = avdi.data_collection
+                    print(f"data_collection columns: {list(dc.columns)}")
+
+                    # Use hour_of_day to filter for daytime (6 AM - 6 PM)
+                    if 'hour_of_day' in dc.columns:
+                        print(f"hour_of_day range: {dc['hour_of_day'].min()} - {dc['hour_of_day'].max()}")
+                        # Daytime = hours 6-18 (6 AM to 6 PM)
+                        daytime_mask_dc = (dc['hour_of_day'] >= 6) & (dc['hour_of_day'] <= 18)
+                        daytime_clips = set(dc[daytime_mask_dc].index.tolist())
+                        print(f"Found {len(daytime_clips)} daytime clips (hours 6-18)")
+
+                        # Intersect with valid clips
+                        valid_clip_set = set(clip_index[valid_mask].index.tolist())
+                        filtered_clips = list(valid_clip_set & daytime_clips)
+                        print(f"After intersection with valid: {len(filtered_clips)} clips")
+
+                        if filtered_clips:
+                            valid_mask = clip_index.index.isin(filtered_clips)
+                    else:
+                        print("No hour_of_day column found, using all clips")
+            except Exception as e:
+                print(f"Could not filter by daytime: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Get filtered clips
+        filtered_clips = clip_index[valid_mask].index.tolist()
+
+        random.seed(42)
+        random.shuffle(filtered_clips)
+        selected_clips = filtered_clips[:num_clips]
+        print(f"Selected {len(selected_clips)} clips: {selected_clips}")
+    except Exception as e:
+        return {"status": "error", "message": f"Could not get clips: {e}"}
+
+    results = []
+    base_output_dir = Path(OUTPUTS_DIR) / "multi_clip_test"
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+
+    for clip_idx, clip_id in enumerate(selected_clips):
+        print(f"\n{'='*60}")
+        print(f"Processing clip {clip_idx+1}/{num_clips}: {clip_id}")
+        print(f"{'='*60}")
+
+        clip_output_dir = base_output_dir / f"clip_{clip_idx}_{clip_id[:15]}"
+        clip_output_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Load clip data
+            camera_feature = avdi.features.CAMERA.CAMERA_FRONT_WIDE_120FOV
+            video = avdi.get_clip_feature(clip_id, camera_feature, maybe_stream=True)
+            egomotion = avdi.get_clip_feature(clip_id, avdi.features.LABELS.EGOMOTION, maybe_stream=True)
+
+            # Use egomotion as interpolator
+            if isinstance(egomotion, physical_ai_av.utils.interpolation.Interpolator):
+                interpolator = egomotion
+            else:
+                interpolator = physical_ai_av.utils.interpolation.Interpolator([egomotion])
+
+            # Default intrinsics for 120° FOV
+            K = np.array([
+                [554, 0, 960],
+                [0, 554, 540],
+                [0, 0, 1]
+            ], dtype=np.float32)
+
+            # Sample timestamps
+            max_ts_us = 14_000_000
+            timestamps_us = np.linspace(0, max_ts_us, num_frames_per_clip).astype(int)
+
+            print(f"Decoding {num_frames_per_clip} frames...")
+            frames, actual_ts = video.decode_images_from_timestamps(timestamps_us)
+
+            saved_frames = []
+            frame_stats = []
+
+            for i, (frame, ts_us) in enumerate(zip(frames, actual_ts)):
+                current_state = interpolator(ts_us)
+                current_pose = current_state.pose
+
+                # Compute waypoints using rotation matrix for proper transform
+                waypoints = []
+
+                # Get current rotation as matrix
+                if hasattr(current_pose, 'rotation'):
+                    try:
+                        if hasattr(current_pose.rotation, 'as_matrix'):
+                            R_current = current_pose.rotation.as_matrix()
+                        elif hasattr(current_pose.rotation, 'R'):
+                            R_current = current_pose.rotation.R
+                        else:
+                            R_current = np.array(current_pose.rotation).reshape(3, 3)
+                    except Exception:
+                        R_current = np.eye(3)
+                else:
+                    R_current = np.eye(3)
+
+                current_trans = np.array(current_pose.translation)
+
+                # Debug first frame
+                if i == 0:
+                    print(f"  Frame 0: current_trans={current_trans}")
+                    print(f"  R_current type: {type(R_current)}")
+
+                for j in range(1, 12):
+                    future_us = ts_us + int(j * 0.25 * 1_000_000)
+                    try:
+                        future_state = interpolator(future_us)
+                        future_pose = future_state.pose
+                        future_trans = np.array(future_pose.translation)
+
+                        # Compute relative position: rotate diff into current frame
+                        diff = future_trans - current_trans
+                        # R_current^T @ diff gives diff in current frame
+                        relative_pos = R_current.T @ diff
+
+                        waypoints.append([float(relative_pos[0]), float(relative_pos[1])])
+
+                        # Debug first frame
+                        if i == 0 and j <= 3:
+                            print(f"    wp{j}: x_fwd={relative_pos[0]:.2f}m, y_left={relative_pos[1]:.2f}m, diff={diff}")
+                    except Exception as e:
+                        if i == 0 and j == 1:
+                            print(f"    wp{j} error: {e}")
+                            import traceback
+                            traceback.print_exc()
+                        if waypoints:
+                            waypoints.append(waypoints[-1])
+                        else:
+                            waypoints.append([0.0, 0.0])
+
+                waypoints = np.array(waypoints, dtype=np.float32)
+
+                # Get speed
+                try:
+                    speed_mps = float(np.linalg.norm(current_state.velocity[:2]))
+                except Exception:
+                    speed_mps = 0.0
+
+                # Create visualization
+                h, w = frame.shape[:2]
+                pil_img = Image.fromarray(frame)
+                draw = ImageDraw.Draw(pil_img)
+
+                # Project waypoints
+                fx, fy = K[0, 0], K[1, 1]
+                cx, cy = K[0, 2], K[1, 2]
+                cam_height = 1.5
+
+                pixels = []
+                for wp_idx, (x_fwd, y_left) in enumerate(waypoints):
+                    if x_fwd > 0.5:  # In front of camera
+                        cam_x = -y_left  # Camera X = -ego Y_left (right is positive in camera)
+                        cam_y = cam_height  # Camera Y = height above ground (down is positive)
+                        cam_z = x_fwd  # Camera Z = ego X_forward
+                        u = fx * cam_x / cam_z + cx
+                        v = fy * cam_y / cam_z + cy
+                        if 0 <= u < w and 0 <= v < h:
+                            pixels.append((int(u), int(v)))
+                        elif i == 0 and wp_idx < 3:
+                            print(f"    wp{wp_idx} out of bounds: u={u:.0f}, v={v:.0f}")
+                    elif i == 0 and wp_idx < 3:
+                        print(f"    wp{wp_idx} behind camera: x_fwd={x_fwd:.2f}m")
+
+                # Draw waypoints
+                for j, (u, v) in enumerate(pixels):
+                    progress = j / max(len(waypoints) - 1, 1)
+                    r = int(255 * progress)
+                    g = int(255 * (1 - progress))
+                    radius = 8
+                    draw.ellipse(
+                        (u - radius, v - radius, u + radius, v + radius),
+                        fill=(r, g, 0), outline=(255, 255, 255), width=2,
+                    )
+                    if j > 0:
+                        prev_u, prev_v = pixels[j - 1]
+                        draw.line([(prev_u, prev_v), (u, v)], fill=(r, g, 0), width=3)
+
+                # Add warning if speed is very low
+                if speed_mps < 1.0:
+                    draw.text((w//2 - 150, h//2), "LOW SPEED - LIMITED WAYPOINTS",
+                              fill=(255, 100, 100), font=font)
+
+                # Add info overlay
+                try:
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
+                except Exception:
+                    font = ImageFont.load_default()
+
+                pil_img = pil_img.convert("RGBA")
+                overlay = Image.new("RGBA", (w, 90), (0, 0, 0, 200))
+                pil_img.paste(overlay, (0, 0), overlay)
+                pil_img = pil_img.convert("RGB")
+                draw = ImageDraw.Draw(pil_img)
+
+                info_text = (
+                    f"Clip {clip_idx+1}/{num_clips}: {clip_id[:25]}...\n"
+                    f"Frame {i+1}/{num_frames_per_clip} | Time: {ts_us/1e6:.2f}s | "
+                    f"Speed: {speed_mps:.1f} m/s ({speed_mps*2.237:.1f} mph)\n"
+                    f"Waypoints: {len(pixels)}/11 visible"
+                )
+                draw.text((10, 8), info_text, fill=(255, 255, 255), font=font)
+
+                # Save frame
+                frame_path = clip_output_dir / f"frame_{i:04d}.png"
+                pil_img.save(frame_path)
+                saved_frames.append(str(frame_path))
+                frame_stats.append({
+                    "frame": i,
+                    "time_s": ts_us/1e6,
+                    "speed_mps": speed_mps,
+                    "waypoints_visible": len(pixels),
+                    "first_wp_dist": float(waypoints[0][0]) if len(waypoints) > 0 else 0,
+                    "last_wp_dist": float(waypoints[-1][0]) if len(waypoints) > 0 else 0,
+                })
+
+                print(f"  Frame {i+1}: speed={speed_mps:.1f} m/s, "
+                      f"waypoints={len(pixels)}/11, t={ts_us/1e6:.2f}s")
+
+            # Create video with ffmpeg
+            video_path = clip_output_dir / "waypoints.mp4"
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-framerate", "3",
+                "-i", str(clip_output_dir / "frame_%04d.png"),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+                str(video_path),
+            ]
+            subprocess.run(ffmpeg_cmd, capture_output=True)
+
+            results.append({
+                "clip_id": clip_id,
+                "status": "success",
+                "output_dir": str(clip_output_dir),
+                "video_path": str(video_path),
+                "num_frames": len(saved_frames),
+                "frame_stats": frame_stats,
+            })
+
+            print(f"✓ Clip {clip_idx+1} complete: {clip_output_dir}")
+
+        except Exception as e:
+            import traceback
+            print(f"✗ Clip {clip_idx+1} failed: {e}")
+            results.append({
+                "clip_id": clip_id,
+                "status": "error",
+                "message": str(e),
+                "traceback": traceback.format_exc(),
+            })
+
+    output_volume.commit()
+
+    # Summary
+    success_count = sum(1 for r in results if r["status"] == "success")
+    print(f"\n{'='*60}")
+    print(f"SUMMARY: {success_count}/{num_clips} clips processed successfully")
+    print(f"Output directory: {base_output_dir}")
+    print(f"{'='*60}")
+
+    return {
+        "status": "success" if success_count == num_clips else "partial",
+        "output_dir": str(base_output_dir),
+        "clips_processed": success_count,
+        "clips_total": num_clips,
+        "results": results,
+    }
 
 
 # ---------------------------------------------------------------------------

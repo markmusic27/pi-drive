@@ -34,6 +34,22 @@ from .nuscenes_loader import ExternalSample, _route_resample_1m
 # ---------------------------------------------------------------------------
 
 
+def _get_rotation_matrix(pose) -> np.ndarray:
+    """Extract 3x3 rotation matrix from pose."""
+    if hasattr(pose, 'rotation'):
+        rot = pose.rotation
+        if hasattr(rot, 'as_matrix'):
+            return rot.as_matrix()
+        elif hasattr(rot, 'R'):
+            return rot.R
+        else:
+            try:
+                return np.array(rot).reshape(3, 3)
+            except Exception:
+                return np.eye(3)
+    return np.eye(3)
+
+
 def egomotion_to_waypoints(
     interpolator,
     frame_timestamp_us: int,
@@ -61,6 +77,10 @@ def egomotion_to_waypoints(
     current_state = interpolator(frame_timestamp_us)
     current_pose = current_state.pose  # RigidTransform
 
+    # Get rotation matrix for transforming to current frame
+    R_current = _get_rotation_matrix(current_pose)
+    current_trans = np.array(current_pose.translation)
+
     waypoints = []
     for i in range(1, num_waypoints + 1):
         future_us = frame_timestamp_us + int(i * spacing_s * 1_000_000)
@@ -75,15 +95,17 @@ def egomotion_to_waypoints(
             continue
 
         future_pose = future_state.pose
+        future_trans = np.array(future_pose.translation)
 
         # Transform future pose to current ego frame
-        # relative_pose = current_pose.inverse() @ future_pose
-        relative_pos = current_pose.inverse().apply(future_pose.translation)
+        # Compute relative position: R_current^T @ (future - current)
+        diff = future_trans - current_trans
+        relative_pos = R_current.T @ diff
 
         # Extract x_forward, y_left (ignore z_up)
         # NVIDIA uses: x_forward, y_left, z_up (same as SimLingo!)
-        x_fwd = relative_pos[0]
-        y_left = relative_pos[1]
+        x_fwd = float(relative_pos[0])
+        y_left = float(relative_pos[1])
 
         waypoints.append(np.array([x_fwd, y_left], dtype=np.float32))
 
@@ -113,6 +135,8 @@ def egomotion_to_route(
 
     current_state = interpolator(frame_timestamp_us)
     current_pose = current_state.pose
+    R_current = _get_rotation_matrix(current_pose)
+    current_trans = np.array(current_pose.translation)
 
     trajectory = []
     for i in range(num_samples):
@@ -120,8 +144,10 @@ def egomotion_to_route(
         try:
             future_state = interpolator(future_us)
             future_pose = future_state.pose
-            relative_pos = current_pose.inverse().apply(future_pose.translation)
-            trajectory.append([relative_pos[0], relative_pos[1]])
+            future_trans = np.array(future_pose.translation)
+            diff = future_trans - current_trans
+            relative_pos = R_current.T @ diff
+            trajectory.append([float(relative_pos[0]), float(relative_pos[1])])
         except Exception:
             break
 
@@ -177,14 +203,18 @@ def get_target_points(
     """
     current_state = interpolator(frame_timestamp_us)
     current_pose = current_state.pose
+    R_current = _get_rotation_matrix(current_pose)
+    current_trans = np.array(current_pose.translation)
 
     target_points = []
     for horizon_s in [horizon_1_s, horizon_2_s]:
         future_us = frame_timestamp_us + int(horizon_s * 1_000_000)
         try:
             future_state = interpolator(future_us)
-            relative_pos = current_pose.inverse().apply(future_state.pose.translation)
-            target_points.append([relative_pos[0], relative_pos[1]])
+            future_trans = np.array(future_state.pose.translation)
+            diff = future_trans - current_trans
+            relative_pos = R_current.T @ diff
+            target_points.append([float(relative_pos[0]), float(relative_pos[1])])
         except Exception:
             # Extrapolate based on current speed
             speed = get_speed_from_egomotion(interpolator, frame_timestamp_us)
@@ -213,40 +243,64 @@ def get_camera_config(
     Returns:
         dict with intrinsics matrix, FOV, image size, and extrinsics.
     """
-    intrinsics = avdi.get_clip_feature(
-        clip_id, avdi.features.CALIBRATION.CAMERA_INTRINSICS
-    )
-    extrinsics = avdi.get_clip_feature(
-        clip_id, avdi.features.CALIBRATION.SENSOR_EXTRINSICS
-    )
-
-    K = intrinsics.get_camera_matrix(camera_name)
-
-    # Extract FOV from focal length: fov = 2 * atan(w / (2 * fx))
+    # Default values for 120° FOV wide camera
     w = 1920  # NVIDIA front camera width
     h = 1080  # NVIDIA front camera height
-    fx = K[0, 0]
-    fov_deg = float(2 * np.degrees(np.arctan(w / (2 * fx))))
+    default_fov = 120.0
+    default_fx = w / (2 * np.tan(np.radians(default_fov / 2)))  # ~554
 
-    # Get camera extrinsics (transform from camera to ego frame)
-    cam_ext = extrinsics.get_transform(camera_name)
+    try:
+        intrinsics = avdi.get_clip_feature(
+            clip_id, avdi.features.CALIBRATION.CAMERA_INTRINSICS, maybe_stream=True
+        )
+        # Check if we have a method to get the camera matrix
+        if hasattr(intrinsics, 'get_camera_matrix'):
+            K = intrinsics.get_camera_matrix(camera_name)
+        elif hasattr(intrinsics, 'camera_models'):
+            # Fallback: try to access camera_models dict
+            cam_model = intrinsics.camera_models.get(camera_name)
+            if cam_model and hasattr(cam_model, 'K'):
+                K = cam_model.K
+            else:
+                raise ValueError("No camera matrix found")
+        else:
+            raise ValueError("Unknown intrinsics format")
 
-    # Camera translation in ego frame
-    # NVIDIA uses: x_forward, y_left, z_up
-    # Convert to viz.py format: (X_right, Y_up, Z_forward)
-    cam_t = cam_ext.translation
-    cam_translation_xyz = (
-        -float(cam_t[1]),  # X_right = -y_left
-        float(cam_t[2]),   # Y_up = z_up
-        float(cam_t[0]),   # Z_forward = x_forward
-    )
+        fx = K[0, 0]
+        fov_deg = float(2 * np.degrees(np.arctan(w / (2 * fx))))
+
+    except Exception as e:
+        # Use default intrinsics for 120° FOV
+        K = np.array([
+            [default_fx, 0, w / 2],
+            [0, default_fx, h / 2],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        fov_deg = default_fov
+
+    # Default camera mount position (roof-mounted, looking forward)
+    cam_translation_xyz = (0.0, 1.5, 2.0)  # (X_right, Y_up, Z_forward)
+
+    try:
+        extrinsics = avdi.get_clip_feature(
+            clip_id, avdi.features.CALIBRATION.SENSOR_EXTRINSICS, maybe_stream=True
+        )
+        if hasattr(extrinsics, 'get_transform'):
+            cam_ext = extrinsics.get_transform(camera_name)
+            cam_t = cam_ext.translation
+            cam_translation_xyz = (
+                -float(cam_t[1]),  # X_right = -y_left
+                float(cam_t[2]),   # Y_up = z_up
+                float(cam_t[0]),   # Z_forward = x_forward
+            )
+    except Exception:
+        pass  # Use default
 
     return {
         "intrinsics": np.array(K, dtype=np.float32),
         "fov_deg": fov_deg,
         "image_size": [w, h],
         "cam_translation_xyz": cam_translation_xyz,
-        "cam_extrinsics": cam_ext,
     }
 
 
