@@ -43,6 +43,12 @@ training:
   gradient_checkpointing: false  # Disabled due to LoRA hook compatibility issues
   max_grad_norm: 1.0
 
+  # Tier A vectorization: single batched forward+backward per step instead of
+  # per-sample loop. Validated 2026-05-18 on tiny smoke against the per-sample
+  # path: val/loss within 0.25% (5.213 vec vs 5.200 unvec). Forces max_num=1
+  # in dynamic_preprocess to guarantee P=1 for clean stacking.
+  vectorized: true
+
   # Evaluation
   eval_steps: 500
   save_steps: 500
