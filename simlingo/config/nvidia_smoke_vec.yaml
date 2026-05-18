@@ -1,0 +1,133 @@
+# SimLingo DDP smoke test config.
+#
+# Tiny-scale 1-epoch validation run to confirm:
+#   - All ranks initialize NCCL without hanging
+#   - DistributedSampler shards correctly
+#   - Loss decreases on rank 0's W&B (sanity-check learning still works)
+#   - LoRA checkpoints save once (rank 0 only) with NO `module.` prefix
+#   - End-of-epoch viz panel renders + logs to W&B
+#
+# Use with B200:2 first (cheaper failure mode than B200:4):
+#   modal run --detach simlingo/modal_training.py::train_multigpu \
+#     --config-path /app/config/nvidia_smoke.yaml
+#
+# After this passes, switch to nvidia_finetune.yaml + B200:4 for the real run.
+
+model:
+  base: "RenzKa/simlingo"
+  backbone: "OpenGVLab/InternVL2-1B"
+
+  num_waypoints: 11
+  waypoint_spacing_s: 0.25
+  route_points: 20
+  route_spacing_m: 1.0
+
+training:
+  # Smaller per-rank batch so we get more optimizer steps per epoch
+  # (1 epoch on tiny = 50 clips × ~50 frames = 2.5K samples → ~26 steps at bs=24×4grad_accum)
+  batch_size: 24
+  gradient_accumulation_steps: 4
+  effective_batch_size: 96  # 24 * 4
+
+  epochs: 1
+  max_steps: null
+
+  learning_rate: 3.0e-5
+  lr_scheduler: cosine
+  warmup_ratio: 0.05
+  warmup_steps: null
+
+  optimizer: adamw
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+  precision: bf16
+  gradient_checkpointing: false
+  max_grad_norm: 1.0
+
+  # Tier A: vectorize the per-sample forward loop.
+  # Forces max_num=1 in dynamic_preprocess so all images yield P=1.
+  vectorized: true
+
+  # Frequent eval/save so we can see early signal
+  eval_steps: 10
+  save_steps: 25
+  logging_steps: 1  # log every optimizer step
+
+  early_stopping: false
+  early_stopping_patience: 5
+  early_stopping_metric: val/loss
+
+lora:
+  enabled: true
+  rank: 32
+  alpha: 64
+  dropout: 0.1
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+  vision_lora: false
+  vision_rank: 16
+
+data:
+  # VECTORIZED smoke: same as nvidia_smoke.yaml but with training.vectorized: true.
+  # train_multigpu doesn't auto-resolve this, so set it explicitly.
+  train_dir: "/nvidia_data/extracted"
+  val_dir: null
+  val_split: 0.1
+
+  image_size: [448, 448]
+  crop_bottom: false
+
+  fov_deg: 120.0
+  use_intrinsics: true
+
+  augmentation:
+    enabled: false  # Disable augmentation for cleaner loss signal during smoke test
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.1
+    hue: 0.05
+
+  num_waypoints: 11
+  waypoint_spacing_s: 0.25
+
+  # Fewer workers for tiny dataset - avoid wasting startup time
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+
+loss:
+  waypoint_loss: smooth_l1
+  waypoint_weight: 1.0
+  route_loss: smooth_l1
+  route_weight: 0.5
+  language_loss: cross_entropy
+  language_weight: 0.0
+
+mdn:
+  enabled: false
+  n_mixtures: 5
+  min_sigma: 0.01
+  input_dim: 896
+
+wandb:
+  project: "simlingo-nvidia-smoke-vec"  # Separate project so smoke runs don't clutter prod
+  entity: null
+  log_interval: 1
+  save_artifacts: false  # No artifact upload for smoke runs
+
+hub:
+  push_to_hub: false
+  repo_id: null
+  private: true
+
+distributed:
+  strategy: ddp
+  find_unused_parameters: true  # LoRA-only grads; needed during smoke to surface any unused-param issues
+
+seed: 42
