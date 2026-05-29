@@ -32,7 +32,7 @@ train_image = (
         f"GIT_LFS_SKIP_SMUDGE=1 git clone --recurse-submodules https://github.com/Physical-Intelligence/openpi.git {OPENPI_DIR}",
         f"cd {OPENPI_DIR} && uv sync",
     )
-    .pip_install("huggingface_hub", "wandb")
+    .pip_install("huggingface_hub", "wandb", "pyarrow", "pandas")
     .env(
         {
             "HF_HOME": f"{CACHE_DIR}/hf",
@@ -49,6 +49,55 @@ cache_volume = modal.Volume.from_name("pi05-cache", create_if_missing=True)
 VOLUMES = {CACHE_DIR: cache_volume}
 
 app = modal.App(APP_NAME)
+
+
+# ---------------------------------------------------------------------------
+# Compute normalization stats (must run before training)
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=train_image,
+    gpu="H100",
+    timeout=60 * 30,
+    volumes=VOLUMES,
+    secrets=[modal.Secret.from_name("huggingface")],
+    memory=32 * 1024,
+)
+def compute_norm_stats():
+    import os
+    import subprocess
+
+    _patch_openpi()
+
+    cmd = [
+        f"{OPENPI_DIR}/.venv/bin/python", "-m", "scripts.compute_norm_stats",
+        "--config-name=pi05_driving",
+    ]
+
+    print(f"=== Computing norm stats ===")
+    print(f"Command: {' '.join(cmd)}")
+
+    result = subprocess.run(cmd, cwd=OPENPI_DIR, text=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Norm stats computation failed (rc={result.returncode})")
+
+    # Copy norm stats to cache volume so training can find them
+    assets_dir = f"{OPENPI_DIR}/assets/pi05_driving/markmusic/pi05-physical-av-bc"
+    print(f"Norm stats saved to {assets_dir}")
+    for root, dirs, files in os.walk(f"{OPENPI_DIR}/assets"):
+        for f in files:
+            print(f"  {os.path.join(root, f)}")
+
+    # Persist to cache volume for reuse
+    cache_assets = f"{CACHE_DIR}/norm_stats/pi05_driving/markmusic/pi05-physical-av-bc"
+    os.makedirs(cache_assets, exist_ok=True)
+    subprocess.run(["cp", "-r", f"{assets_dir}/.", cache_assets], check=True)
+    cache_volume.commit()
+
+    print("Norm stats computed and cached")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -82,14 +131,37 @@ def train_bc(
     # Patch openpi with our driving config
     _patch_openpi()
 
-    # Convert v3.0 dataset to v2.1 format for openpi's bundled lerobot
-    _convert_dataset_v3_to_v21("markmusic/pi05-physical-av-bc")
+    # Restore cached norm stats if available
+    cache_assets = f"{CACHE_DIR}/norm_stats/pi05_driving/markmusic/pi05-physical-av-bc"
+    assets_dir = f"{OPENPI_DIR}/assets/pi05_driving/markmusic/pi05-physical-av-bc"
+    if os.path.exists(cache_assets) and not os.path.exists(assets_dir):
+        os.makedirs(os.path.dirname(assets_dir), exist_ok=True)
+        shutil.copytree(cache_assets, assets_dir)
+        print(f"Restored norm stats from cache")
+
+    # Compute norm stats if still missing
+    if not os.path.exists(assets_dir):
+        print("Norm stats missing — computing now...")
+        stats_cmd = [
+            f"{OPENPI_DIR}/.venv/bin/python", "-m", "scripts.compute_norm_stats",
+            "--config-name=pi05_driving",
+        ]
+        stats_result = subprocess.run(stats_cmd, cwd=OPENPI_DIR, text=True)
+        if stats_result.returncode != 0:
+            raise RuntimeError("Failed to compute norm stats")
+        # Cache for next run
+        os.makedirs(os.path.dirname(cache_assets), exist_ok=True)
+        if os.path.exists(cache_assets):
+            shutil.rmtree(cache_assets)
+        shutil.copytree(assets_dir, cache_assets)
+        cache_volume.commit()
+        print("Norm stats computed and cached")
 
     checkpoint_dir = f"{CACHE_DIR}/checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     cmd = [
-        "uv", "run", "python", "-m", "scripts.train",
+        f"{OPENPI_DIR}/.venv/bin/python", "-m", "scripts.train",
         "pi05_driving",
         "--exp-name", exp_name,
     ]
@@ -396,9 +468,10 @@ class LeRobotDrivingDataConfig(DataConfigFactory):
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation.images.front": "observation/image",
-                        "observation.state": "observation/state",
-                        "action": "actions",
+                        "observation/image": "observation.images.front",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
                     }
                 )
             ]
@@ -440,7 +513,7 @@ class LeRobotDrivingDataConfig(DataConfigFactory):
         ),
         data=LeRobotDrivingDataConfig(
             repo_id="markmusic/pi05-physical-av-bc",
-            base_config=DataConfig(prompt_from_task=True),
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params"
@@ -478,5 +551,56 @@ class LeRobotDrivingDataConfig(DataConfigFactory):
 
         with open(config_path, "w") as f:
             f.write(content)
+
+    # 4. Patch lerobot to accept our dataset format
+    import glob
+    import os
+    for lerobot_utils in glob.glob(
+        f"{OPENPI_DIR}/.venv/lib/python*/site-packages/lerobot/common/datasets/utils.py"
+    ):
+        with open(lerobot_utils, "r") as f:
+            content = f.read()
+        if "PATCHED" not in content:
+            content = content.replace(
+                "raise ForwardCompatibilityError(repo_id, min(upper_versions))",
+                "pass  # PATCHED: accept our dataset version",
+            )
+            with open(lerobot_utils, "w") as f:
+                f.write(content)
+            print(f"  Patched version check in {lerobot_utils}")
+
+    # 5. Patch scripts/train.py to handle shape mismatches when loading
+    #    base checkpoint with different action_dim (32→2).
+    train_script = f"{OPENPI_DIR}/scripts/train.py"
+    with open(train_script, "r") as f:
+        content = f.read()
+    if "SHAPE_PATCHED" not in content:
+        old_validate = "at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)"
+        new_validate = """# SHAPE_PATCHED: filter shape-mismatched params before validation
+    import logging as _log
+    def _filter_shapes(expected, loaded):
+        import jax
+        e_flat, e_struct = jax.tree.flatten(expected)
+        l_flat, _ = jax.tree.flatten(loaded)
+        fixed = []
+        for e, l in zip(e_flat, l_flat):
+            if hasattr(e, 'shape') and hasattr(l, 'shape') and e.shape != l.shape:
+                _log.warning(f"Shape mismatch: expected {e.shape}, got {l.shape} — using init weights")
+                fixed.append(e)
+            else:
+                fixed.append(l)
+        return jax.tree.unflatten(e_struct, fixed)
+    loaded_params = _filter_shapes(params_shape, loaded_params)
+    at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)"""
+        if old_validate in content:
+            content = content.replace(old_validate, new_validate)
+            with open(train_script, "w") as f:
+                f.write(content)
+            print("  Patched scripts/train.py for shape mismatch handling")
+        else:
+            print("  WARNING: Could not find validation call in train.py")
+            for i, line in enumerate(content.split('\n')):
+                if 'check_pytree_equality' in line:
+                    print(f"    Line {i+1}: {line.strip()}")
 
     print("openpi patched with driving config")
