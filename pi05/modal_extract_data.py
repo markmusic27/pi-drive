@@ -5,9 +5,9 @@ Step 1b: Label navigation intent with Gemini Flash (VLM-based).
 Step 2: Build LeRobot v2 dataset and push to HuggingFace.
 
 Usage:
+    modal run pi05/modal_extract_data.py::extract_parallel --scale large
     modal run pi05/modal_extract_data.py::extract_driving_data --scale tiny
     modal run pi05/modal_extract_data.py::label_nav_prompts --scale tiny
-    modal run pi05/modal_extract_data.py::build_lerobot_dataset
 """
 
 from __future__ import annotations
@@ -107,7 +107,288 @@ T0_OFFSETS_US = [
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Extract GT egomotion + images + nav prompts
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _trajectory_to_nav_prompt(ego_future_xyz):
+    forward = ego_future_xyz[-1, 0]
+    lateral = ego_future_xyz[-1, 1]
+    if forward < 2.0:
+        return "stop"
+    if abs(lateral) < 1.0:
+        return "drive forward"
+    if lateral > 3.0:
+        return "turn left"
+    if lateral < -3.0:
+        return "turn right"
+    if lateral > 0:
+        return "bear left"
+    return "bear right"
+
+
+def _filter_clips(avdi):
+    """Filter clip_index for right-hand-traffic, daytime, valid sensors."""
+    import os
+    import pandas as pd
+
+    clip_index = avdi.clip_index.copy()
+
+    try:
+        metadata_dir = os.path.dirname(avdi._clip_index_path)
+        dc_path = os.path.join(metadata_dir, "data_collection.parquet")
+        fp_path = os.path.join(metadata_dir, "metadata", "feature_presence.parquet")
+
+        if os.path.exists(dc_path):
+            metadata = pd.read_parquet(dc_path)
+            filtered = metadata[
+                (metadata["country"].isin(RIGHT_HAND_TRAFFIC))
+                & (metadata["time_of_day"] == "daytime")
+            ]
+            valid_clips = set(filtered["clip_id"].tolist())
+            print(f"  Country+daylight filter: {len(valid_clips)} clips")
+        else:
+            valid_clips = set(clip_index.index.tolist())
+            print("  No data_collection.parquet, skipping country/daylight filter")
+
+        if os.path.exists(fp_path):
+            features = pd.read_parquet(fp_path)
+            has_sensors = features[
+                (features.get("has_egomotion", True) == True)
+                & (features.get("has_camera_front_wide", True) == True)
+            ]
+            valid_clips &= set(has_sensors["clip_id"].tolist())
+            print(f"  Sensor filter: {len(valid_clips)} clips")
+    except Exception as e:
+        print(f"  Warning: metadata filtering failed ({e}), using all clips")
+        valid_clips = set(clip_index.index.tolist())
+
+    return [c for c in clip_index.index if c in valid_clips]
+
+
+def _process_clips(clip_ids, eval_clip_set, scale, avdi=None):
+    """Process a list of clips, return sample dicts. Core extraction logic."""
+    import os
+    import numpy as np
+    from PIL import Image
+
+    from alpamayo_r1.action_space.unicycle_accel_curvature import (
+        UnicycleAccelCurvatureActionSpace,
+    )
+    from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
+
+    if avdi is None:
+        import physical_ai_av
+        avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
+
+    action_space = UnicycleAccelCurvatureActionSpace()
+    output_dir = f"{CACHE_DIR}/extracted/{scale}"
+    os.makedirs(f"{output_dir}/images", exist_ok=True)
+
+    samples = []
+    errors = []
+    dt = 0.1
+
+    for clip_id in clip_ids:
+        for t0_us in T0_OFFSETS_US:
+            sample_id = f"{clip_id}_{t0_us}"
+            try:
+                data = load_physical_aiavdataset(
+                    clip_id,
+                    t0_us=t0_us,
+                    avdi=avdi,
+                    maybe_stream=True,
+                    camera_features=[avdi.features.CAMERA.CAMERA_FRONT_WIDE_120FOV],
+                    num_frames=1,
+                )
+
+                ego_hist = data["ego_history_xyz"][0, 0].numpy()
+                velocities = np.linalg.norm(np.diff(ego_hist, axis=0), axis=1) / dt
+                speed_at_t0 = velocities[-1]
+                if speed_at_t0 < 1.0:
+                    continue
+
+                ego_fut = data["ego_future_xyz"][0, 0].numpy()
+                traj_length = np.sum(np.linalg.norm(np.diff(ego_fut, axis=0), axis=1))
+                if traj_length < 10.0:
+                    continue
+
+                actions = action_space.traj_to_action(
+                    traj_history_xyz=data["ego_history_xyz"],
+                    traj_history_rot=data["ego_history_rot"],
+                    traj_future_xyz=data["ego_future_xyz"],
+                    traj_future_rot=data["ego_future_rot"],
+                )
+                actions_np = actions[0, 0].numpy()
+
+                lateral_disp = float(ego_fut[-1, 1])
+                forward_disp = float(ego_fut[-1, 0])
+                from alpamayo_r1.geometry.rotation import so3_to_yaw_torch
+                fut_yaws = so3_to_yaw_torch(data["ego_future_rot"][0, 0]).numpy()
+                heading_change_deg = float(np.degrees(fut_yaws[-1] - fut_yaws[0]))
+
+                nav_prompt = _trajectory_to_nav_prompt(ego_fut)
+
+                yaws = so3_to_yaw_torch(data["ego_history_rot"][0, 0]).numpy()
+                heading_rate = (yaws[-1] - yaws[-2]) / dt if len(yaws) > 1 else 0.0
+                state = np.array([speed_at_t0, heading_rate], dtype=np.float32)
+
+                img_tensor = data["image_frames"][0, 0]
+                img_np = img_tensor.permute(1, 2, 0).numpy().astype(np.uint8)
+                img_pil = Image.fromarray(img_np)
+                img_pil = img_pil.resize((640, 480), Image.LANCZOS)
+                img_pil.save(f"{output_dir}/images/{sample_id}.jpg", quality=90)
+
+                samples.append({
+                    "sample_id": sample_id,
+                    "clip_id": clip_id,
+                    "t0_us": t0_us,
+                    "split": "eval" if clip_id in eval_clip_set else "train",
+                    "nav_prompt": nav_prompt,
+                    "speed": float(state[0]),
+                    "heading_rate": float(state[1]),
+                    "lateral_disp": lateral_disp,
+                    "forward_disp": forward_disp,
+                    "heading_change_deg": heading_change_deg,
+                    "actions": actions_np.tolist(),
+                    "image_path": f"images/{sample_id}.jpg",
+                })
+            except Exception as e:
+                errors.append({"clip_id": clip_id, "t0_us": t0_us, "error": str(e)})
+
+    return samples, errors
+
+
+# ---------------------------------------------------------------------------
+# Parallel extraction (recommended for large scale)
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=extract_image,
+    volumes=VOLUMES,
+    gpu="T4",
+    timeout=60 * 60 * 2,
+    memory=32 * 1024,
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def _extract_clip_batch(
+    clip_ids: list[str],
+    eval_clip_ids: list[str],
+    scale: str,
+    batch_idx: int,
+) -> dict:
+    """Process a batch of clips. Called in parallel by extract_parallel."""
+    import time
+
+    t0 = time.time()
+    eval_set = set(eval_clip_ids)
+    samples, errors = _process_clips(clip_ids, eval_set, scale)
+    cache_volume.commit()
+
+    elapsed = time.time() - t0
+    rate = len(clip_ids) / elapsed if elapsed > 0 else 0
+    print(
+        f"Batch {batch_idx}: {len(clip_ids)} clips → {len(samples)} samples, "
+        f"{len(errors)} errors, {elapsed:.0f}s ({rate:.1f} clips/s)"
+    )
+    return {"samples": samples, "errors": errors}
+
+
+@app.function(
+    image=extract_image,
+    volumes=VOLUMES,
+    gpu="T4",
+    timeout=60 * 60 * 4,
+    memory=32 * 1024,
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def extract_parallel(
+    scale: str = "large",
+    seed: int = 42,
+    eval_frac: float = 0.1,
+    batch_size: int = 100,
+):
+    """Parallel extraction across many Modal containers."""
+    import os
+    import time
+
+    import numpy as np
+    import pandas as pd
+    import physical_ai_av
+
+    max_clips = SCALES[scale]
+    print(f"=== Parallel extraction: {scale} scale, {max_clips} clips ===")
+
+    avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
+    print(f"Dataset: {len(avdi.clip_index)} total clips")
+
+    available_clips = _filter_clips(avdi)
+    print(f"Available after filtering: {len(available_clips)} clips")
+
+    rng = np.random.default_rng(seed)
+    if len(available_clips) > max_clips:
+        selected_clips = rng.choice(available_clips, size=max_clips, replace=False).tolist()
+    else:
+        selected_clips = available_clips[:max_clips]
+
+    n_eval = max(1, int(len(selected_clips) * eval_frac))
+    rng.shuffle(selected_clips)
+    eval_clips = selected_clips[:n_eval]
+    print(f"Selected {len(selected_clips)} clips: {len(selected_clips) - n_eval} train, {n_eval} eval")
+
+    output_dir = f"{CACHE_DIR}/extracted/{scale}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    batches = [
+        selected_clips[i : i + batch_size]
+        for i in range(0, len(selected_clips), batch_size)
+    ]
+    n_batches = len(batches)
+    print(f"Launching {n_batches} parallel workers ({batch_size} clips each)...")
+    t_start = time.time()
+
+    results = list(
+        _extract_clip_batch.map(
+            batches,
+            [eval_clips] * n_batches,
+            [scale] * n_batches,
+            list(range(n_batches)),
+        )
+    )
+
+    all_samples = []
+    all_errors = []
+    for r in results:
+        all_samples.extend(r["samples"])
+        all_errors.extend(r["errors"])
+
+    df = pd.DataFrame(all_samples)
+    df.to_parquet(f"{output_dir}/samples.parquet", index=False)
+
+    if all_errors:
+        pd.DataFrame(all_errors).to_parquet(f"{output_dir}/errors.parquet", index=False)
+
+    elapsed = time.time() - t_start
+    print(f"\n=== Results ===")
+    print(f"Total samples: {len(df)}")
+    if len(df) > 0:
+        print(f"Train: {(df['split'] == 'train').sum()}, Eval: {(df['split'] == 'eval').sum()}")
+        print(f"Errors: {len(all_errors)}")
+        print(f"\nNav prompt distribution:")
+        print(df["nav_prompt"].value_counts().to_string())
+        print(f"\nSpeed stats: mean={df['speed'].mean():.2f}, "
+              f"std={df['speed'].std():.2f}, "
+              f"min={df['speed'].min():.2f}, max={df['speed'].max():.2f}")
+
+    cache_volume.commit()
+    print(f"\nWall time: {elapsed:.0f}s ({elapsed/60:.1f} min)")
+    print(f"Effective rate: {len(selected_clips)/elapsed:.1f} clips/s")
+    return len(df)
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Extract GT egomotion + images + nav prompts (sequential, for small scales)
 # ---------------------------------------------------------------------------
 
 
@@ -219,13 +500,30 @@ def extract_driving_data(scale: str = "tiny", seed: int = 42, eval_frac: float =
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(f"{output_dir}/images", exist_ok=True)
 
+    # Resume from checkpoint if available
+    checkpoint_path = f"{output_dir}/samples_checkpoint.parquet"
+    processed_ids = set()
     samples = []
+    if os.path.exists(checkpoint_path):
+        existing = pd.read_parquet(checkpoint_path)
+        samples = existing.to_dict("records")
+        processed_ids = set(existing["sample_id"].tolist())
+        print(f"  Resuming from checkpoint: {len(samples)} samples already extracted")
+
     errors = []
     t_start = time.time()
+    checkpoint_interval = 50
 
     for clip_idx, clip_id in enumerate(tqdm(selected_clips, desc="Extracting")):
+        # Skip clips where all t0 offsets are already processed
+        clip_sample_ids = {f"{clip_id}_{t0}" for t0 in T0_OFFSETS_US}
+        if clip_sample_ids.issubset(processed_ids):
+            continue
+
         for t0_us in T0_OFFSETS_US:
             sample_id = f"{clip_id}_{t0_us}"
+            if sample_id in processed_ids:
+                continue
             try:
                 # Load egomotion + front camera only
                 data = load_physical_aiavdataset(
@@ -309,16 +607,24 @@ def extract_driving_data(scale: str = "tiny", seed: int = 42, eval_frac: float =
                 if len(errors) <= 5:
                     print(f"  Error on {clip_id} t0={t0_us}: {e}")
 
-        if (clip_idx + 1) % 100 == 0:
+        # Checkpoint every N clips
+        if (clip_idx + 1) % checkpoint_interval == 0:
+            ckpt_df = pd.DataFrame(samples)
+            ckpt_df.to_parquet(checkpoint_path, index=False)
+            cache_volume.commit()
             elapsed = time.time() - t_start
             rate = (clip_idx + 1) / elapsed
-            print(f"  {clip_idx+1}/{len(selected_clips)} clips, "
+            print(f"  Checkpoint: {clip_idx+1}/{len(selected_clips)} clips, "
                   f"{len(samples)} samples, {len(errors)} errors, "
                   f"{rate:.1f} clips/s")
 
-    # Save metadata
+    # Save final metadata
     df = pd.DataFrame(samples)
     df.to_parquet(f"{output_dir}/samples.parquet", index=False)
+
+    # Remove checkpoint file now that we have the final version
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
 
     # Save error log
     if errors:
@@ -384,7 +690,7 @@ Respond with ONLY the category name, nothing else."""
     memory=8 * 1024,
     secrets=[modal.Secret.from_name("google-ai")],
 )
-def label_nav_prompts(scale: str = "tiny", batch_size: int = 16):
+def label_nav_prompts(scale: str = "tiny", checkpoint_interval: int = 50):
     import base64
     import os
     import time
@@ -405,15 +711,27 @@ def label_nav_prompts(scale: str = "tiny", batch_size: int = 16):
     df = pd.read_parquet(samples_path)
     print(f"Loaded {len(df)} samples for VLM labeling")
 
-    labeled = []
+    # Resume: if nav_prompt_traj column exists, skip already-labeled rows
+    already_labeled = "nav_prompt_traj" in df.columns
+    if already_labeled:
+        unlabeled_mask = df["nav_prompt"] == df["nav_prompt_traj"]
+        n_done = (~unlabeled_mask).sum()
+        print(f"  Resuming: {n_done} already labeled, {unlabeled_mask.sum()} remaining")
+    else:
+        unlabeled_mask = pd.Series([True] * len(df))
+        df["nav_prompt_traj"] = df["nav_prompt"].copy()
+
+    labeled = df["nav_prompt"].tolist()
     errors = []
     t_start = time.time()
 
     for idx, row in tqdm(df.iterrows(), total=len(df), desc="Labeling"):
+        if not unlabeled_mask.iloc[idx]:
+            continue
+
         img_path = f"{output_dir}/{row['image_path']}"
         if not os.path.exists(img_path):
             errors.append({"idx": idx, "error": "image not found"})
-            labeled.append(row["nav_prompt"])
             continue
 
         lateral = row.get("lateral_disp", 0.0)
@@ -440,24 +758,30 @@ def label_nav_prompts(scale: str = "tiny", batch_size: int = 16):
 
             raw = response.text.strip().strip('"').lower()
             if raw in NAV_CATEGORIES:
-                labeled.append(raw)
+                labeled[idx] = raw
             else:
                 for cat in NAV_CATEGORIES:
                     if cat in raw:
-                        labeled.append(cat)
+                        labeled[idx] = cat
                         break
                 else:
                     print(f"  Warning: unexpected VLM output '{raw}' for {row['sample_id']}, keeping trajectory-based label")
-                    labeled.append(row["nav_prompt"])
 
         except Exception as e:
             errors.append({"idx": idx, "error": str(e)})
-            labeled.append(row["nav_prompt"])
             if len(errors) <= 5:
                 print(f"  Error on {row['sample_id']}: {e}")
-            time.sleep(1)
+            time.sleep(2)
 
-    df["nav_prompt_traj"] = df["nav_prompt"]
+        # Checkpoint every N samples
+        if (idx + 1) % checkpoint_interval == 0:
+            df["nav_prompt"] = labeled
+            df.to_parquet(samples_path, index=False)
+            cache_volume.commit()
+            n_labeled = sum(a != b for a, b in zip(labeled, df["nav_prompt_traj"]))
+            print(f"  Checkpoint: {n_labeled}/{len(df)} labeled, {len(errors)} errors")
+
+    # Final save
     df["nav_prompt"] = labeled
 
     df.to_parquet(samples_path, index=False)

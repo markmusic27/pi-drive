@@ -89,8 +89,13 @@ samples_path = f"{{output_dir}}/samples.parquet"
 df = pd.read_parquet(samples_path)
 print(f"Loaded {{len(df)}} samples from {{samples_path}}")
 
+# Reassign train/eval split by clip_id (90/10) in case extraction order was skewed
+clip_ids = df["clip_id"].unique()
+n_eval = max(1, int(len(clip_ids) * 0.1))
+eval_clips = set(clip_ids[:n_eval])
+df["split"] = df["clip_id"].apply(lambda c: "eval" if c in eval_clips else "train")
 train_df = df[df["split"] == "train"].reset_index(drop=True)
-print(f"Train samples: {{len(train_df)}}")
+print(f"Train samples: {{len(train_df)}}, Eval: {{(df['split'] == 'eval').sum()}}")
 
 # Check datasets version for debugging
 import datasets

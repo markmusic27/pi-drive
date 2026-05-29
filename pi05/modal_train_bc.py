@@ -603,4 +603,72 @@ class LeRobotDrivingDataConfig(DataConfigFactory):
                 if 'check_pytree_equality' in line:
                     print(f"    Line {i+1}: {line.strip()}")
 
+    # 6. Add LR logging + eval loss to scripts/train.py
+    with open(train_script, "r") as f:
+        content = f.read()
+    if "LR_EVAL_PATCHED" not in content:
+        # Patch A: Add eval_step_fn before main()
+        content = content.replace(
+            "def main(config: _config.TrainConfig):",
+            '''def eval_step_fn(
+    config: _config.TrainConfig,
+    rng,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+):
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+    observation, actions = batch
+    return jnp.mean(model.compute_loss(rng, observation, actions, train=False))
+
+
+def main(config: _config.TrainConfig):  # LR_EVAL_PATCHED''',
+        )
+
+        # Patch B: Add LR schedule, peval_step, and cached eval batches before training loop
+        content = content.replace(
+            "    start_step = int(train_state.step)",
+            '''    lr_schedule_fn = config.lr_schedule.create()
+
+    peval_step = jax.jit(
+        functools.partial(eval_step_fn, config),
+        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        out_shardings=replicated_sharding,
+    )
+
+    _eval_batches = []
+    for _ in range(5):
+        _eval_batches.append(next(data_iter))
+    logging.info(f"Cached {len(_eval_batches)} batches for eval")
+
+    start_step = int(train_state.step)''',
+        )
+
+        # Patch C: Add LR to logged metrics
+        content = content.replace(
+            "            wandb.log(reduced_info, step=step)",
+            '''            reduced_info["learning_rate"] = float(lr_schedule_fn(step))
+            wandb.log(reduced_info, step=step)''',
+        )
+
+        # Patch D: Add eval loss at checkpoint intervals
+        content = content.replace(
+            '''        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)''',
+            '''        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+            if _eval_batches:
+                _el = []
+                for _eb in _eval_batches:
+                    with sharding.set_mesh(mesh):
+                        _el.append(peval_step(train_rng, train_state, _eb))
+                _eval_loss = float(np.mean([float(jax.device_get(x)) for x in _el]))
+                pbar.write(f"Step {step}: eval_loss={_eval_loss:.4f}")
+                wandb.log({"eval_loss": _eval_loss}, step=step)
+            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)''',
+        )
+
+        with open(train_script, "w") as f:
+            f.write(content)
+        print("  Patched scripts/train.py for LR + eval loss logging")
+
     print("openpi patched with driving config")
