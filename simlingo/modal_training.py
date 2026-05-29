@@ -65,7 +65,12 @@ CKPT_DIR = f"{DATA_DIR}/checkpoint"
 
 training_image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04",
+        # CUDA 12.8 base — required for B200 sm_100 kernels in PyTorch.
+        # PyTorch 2.4.1+cu124 did NOT include sm_100 in its prebuilt kernels
+        # (smoke failed with "no kernel image is available for execution on
+        # the device"). PyTorch 2.7 with cu128 wheels is the first official
+        # release with sm_100 binaries baked in.
+        "nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04",
         add_python="3.11",  # Python 3.11 for physical_ai_av
     )
     .apt_install(
@@ -77,12 +82,12 @@ training_image = (
         "libglib2.0-0",
         "ffmpeg",  # For video encoding
     )
-    # PyTorch with CUDA 12.1 (matching SimLingo's tested versions)
+    # PyTorch 2.7.0 + CUDA 12.8 wheels (sm_100 / B200 / Blackwell support).
     .pip_install(
-        "torch==2.2.0",
-        "torchvision==0.17.0",
-        "torchaudio==2.2.0",
-        index_url="https://download.pytorch.org/whl/cu121",
+        "torch==2.7.0",
+        "torchvision==0.22.0",
+        "torchaudio==2.7.0",
+        index_url="https://download.pytorch.org/whl/cu128",
     )
     # NVIDIA PhysicalAI-AV SDK first (has strict huggingface-hub requirement)
     .pip_install(
@@ -408,10 +413,20 @@ def train(
 @app.function(
     image=training_image,
     volumes=VOLUMES,
-    gpu="H100:4",  # 4x H100 (B200 requires CUDA 12.4+ / PyTorch 2.4+ with sm_100; current image is 12.1)
-    timeout=60 * 60 * 24,  # 24 hours max (Modal limit)
-    cpu=32,
-    memory=256 * 1024,
+    # H100:8 (sm_90) — 2x throughput vs H100:4. We pair this with the config's
+    # batch_size=24 (override from 48) so the effective batch stays 24*8*4=768,
+    # preserving the same convergence-per-step as the previous H100:4 setup
+    # while halving the wallclock per epoch. B200 NCCL is still blocked on
+    # Modal (4+ min silent stall at comm init with PyTorch 2.7+cu128); revisit
+    # B200:8 once that's fixed.
+    gpu="H100:8",
+    timeout=86400,  # 24h (Modal's hard maximum per function call). User
+                    # requested 36h but Modal caps at 86400s. To go longer,
+                    # re-invoke with --resume-from <latest ckpt> after the
+                    # job hits the cap; combine with the SAVE_NOW sentinel
+                    # (request_checkpoint below) for proactive saves.
+    cpu=64,        # 8 GPUs * dataloader workers
+    memory=512 * 1024,
     secrets=[
         modal.Secret.from_name("huggingface"),
         modal.Secret.from_name("wandb"),
@@ -421,17 +436,38 @@ def train_multigpu(
     config_path: str = "/app/config/nvidia_finetune.yaml",
     wandb_project: str = "simlingo-nvidia-finetune",
     hf_repo: str | None = None,
+    resume_from: str | None = None,
+    auto_resume: bool = False,
 ) -> dict:
-    """Multi-GPU training with DDP.
+    """Multi-GPU training with DDP on 8x H100.
 
-    Same as `train` but uses 4x H100 GPUs for fastest training on larger datasets.
+    Streams torchrun stdout/stderr live to Modal logs (no more buffering blindspot).
+    Pass `--hf-repo <user>/<repo>` to override the config's hub.repo_id.
+    Pass `--resume-from <ckpt>` to resume from a saved checkpoint (e.g. on early
+    stop + restart).
+    Pass `--auto-resume` to auto-pick the most recent checkpoint on the
+    `simlingo-checkpoints` volume — useful when bridging a 24h timeout into a
+    follow-on run.
     """
     import subprocess
+    import sys as _sys
 
-    # Use torchrun for DDP
+    # Auto-resume: find the most recently modified checkpoint on the volume
+    # if no explicit --resume-from was provided. Preference order:
+    # checkpoint_best.pt > checkpoint_epoch_*.pt (highest) > checkpoint_step_*.pt
+    # > any other checkpoint_*.pt by mtime.
+    if auto_resume and not resume_from:
+        ckpt_dir = Path(CHECKPOINTS_DIR)
+        candidates = sorted(ckpt_dir.glob("checkpoint_*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if candidates:
+            resume_from = str(candidates[0])
+            print(f"[auto-resume] picked latest checkpoint: {resume_from}", flush=True)
+        else:
+            print("[auto-resume] no checkpoints found; starting fresh", flush=True)
+
     cmd = [
         "torchrun",
-        "--nproc_per_node=4",
+        "--nproc_per_node=8",
         "--master_port=29500",
         "-m", "scripts.nvidia_trainer",
         "--config", config_path,
@@ -440,21 +476,162 @@ def train_multigpu(
     ]
     if hf_repo:
         cmd.extend(["--hf-repo", hf_repo])
+    if resume_from:
+        cmd.extend(["--resume-from", resume_from])
 
-    print(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    print(f"Running: {' '.join(cmd)}", flush=True)
 
-    if result.returncode != 0:
-        print(f"Training failed: {result.stderr}")
-        raise RuntimeError(result.stderr)
+    # NCCL config for B200 (sm_100) on Modal single-node multi-GPU:
+    #   - NCCL_DEBUG=INFO + NCCL_DEBUG_SUBSYS=ALL surfaces every init step so we
+    #     can see exactly where bootstrap stalls.
+    #   - NCCL_IB_DISABLE=1: Modal containers don't expose InfiniBand; let
+    #     NCCL skip the IB probe (which can stall ~30s otherwise).
+    #   - NCCL_SOCKET_IFNAME=lo: all 4 ranks are in the SAME container, so
+    #     bootstrap goes over loopback. Without this NCCL may pick a stale
+    #     virtual interface and hang.
+    #   - TORCH_NCCL_BLOCKING_WAIT=1 / TORCH_NCCL_ASYNC_ERROR_HANDLING=1 turn
+    #     indefinite hangs into a timeout + stack trace (PyTorch 2.7 names).
+    #   - PYTHONUNBUFFERED=1 ensures child process prints stream to logs.
+    env = os.environ.copy()
+    env.update({
+        "NCCL_DEBUG": "INFO",
+        "NCCL_DEBUG_SUBSYS": "ALL",
+        "NCCL_IB_DISABLE": "1",
+        "NCCL_SOCKET_IFNAME": "lo",
+        "TORCH_NCCL_BLOCKING_WAIT": "1",
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+        "NCCL_ASYNC_ERROR_HANDLING": "1",
+        "PYTHONUNBUFFERED": "1",
+    })
+
+    # Stream output instead of capturing — gives live train/loss visibility in
+    # `modal app logs <app-id>` and avoids the OOM risk of unbounded buffering
+    # on a multi-day run.
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+    try:
+        for line in proc.stdout:
+            _sys.stdout.write(line)
+            _sys.stdout.flush()
+    finally:
+        rc = proc.wait()
+
+    if rc != 0:
+        raise RuntimeError(f"torchrun exited with code {rc}")
 
     checkpoint_volume.commit()
+    return {"status": "completed", "returncode": rc}
 
-    return {"status": "completed", "output": result.stdout}
+
+# ---------------------------------------------------------------------------
+# Out-of-band checkpoint controls
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=training_image,
+    volumes=VOLUMES,
+    timeout=60,
+    cpu=1,
+    memory=512,
+)
+def request_checkpoint(tag: str = "manual") -> dict:
+    """Ask the running trainer to save a checkpoint right now.
+
+    Writes a sentinel file `SAVE_NOW.<tag>` into the simlingo-checkpoints
+    volume and commits it. The trainer's rank-0 process polls the volume
+    every 10 optimizer steps; on detection it saves
+    `checkpoint_<tag>.pt`, `lora_<tag>.pt`, `training_state_<tag>.pt`,
+    then deletes the sentinel.
+
+    Usage:
+        modal run simlingo/modal_training.py::request_checkpoint --tag liked
+    """
+    from pathlib import Path
+
+    # Sanitize: filename-safe chars only, fall back to "manual".
+    safe_tag = "".join(c for c in tag if c.isalnum() or c in "_-").strip("_-")
+    safe_tag = safe_tag or "manual"
+
+    sentinel = Path(CHECKPOINTS_DIR) / f"SAVE_NOW.{safe_tag}"
+    sentinel.touch()
+    checkpoint_volume.commit()
+    print(f"Queued checkpoint save with tag='{safe_tag}' -> {sentinel}")
+    return {"status": "queued", "tag": safe_tag, "sentinel": str(sentinel)}
 
 
 # ---------------------------------------------------------------------------
 # Evaluation
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=training_image,
+    volumes=VOLUMES,
+    gpu="H100",
+    timeout=60 * 60,
+    cpu=8,
+    memory=64 * 1024,
+    secrets=[
+        modal.Secret.from_name("huggingface"),
+        modal.Secret.from_name("wandb"),
+    ],
+)
+def evaluate_loss(
+    checkpoint_name: str = "epoch_1",
+    config_path: str = "/app/config/nvidia_finetune.yaml",
+) -> dict:
+    """Load a saved checkpoint and run trainer.validate() to report val loss.
+
+    `checkpoint_name` is the suffix from `checkpoint_<name>.pt` on the
+    `simlingo-checkpoints` volume (e.g. `epoch_1`, `best`, `step_500`,
+    `manual_liked`).
+
+    Returns the validate() metrics dict (val_loss, val_wp_loss, val_route_loss).
+
+    Usage:
+        modal run simlingo/modal_training.py::evaluate_loss --checkpoint-name epoch_1
+    """
+    import os
+    import yaml
+    import wandb
+
+    sys.path.insert(0, SIMLINGO_REPO_DIR)
+    sys.path.insert(0, "/app")
+
+    from scripts.nvidia_trainer import NVIDIASimLingoTrainer
+
+    # Disable W&B for the eval-only run.
+    os.environ["WANDB_MODE"] = "disabled"
+    wandb.init(mode="disabled")
+
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+
+    trainer = NVIDIASimLingoTrainer(
+        config=config,
+        ckpt_dir=os.environ.get("CKPT_DIR", "/data/checkpoint"),
+        output_dir=CHECKPOINTS_DIR,
+        hf_repo=None,
+    )
+
+    ckpt_path = f"{CHECKPOINTS_DIR}/checkpoint_{checkpoint_name}.pt"
+    print(f"Loading checkpoint: {ckpt_path}")
+    trainer.load_checkpoint(ckpt_path)
+
+    metrics = trainer.validate()
+    print(f"[evaluate_loss] checkpoint={checkpoint_name} metrics={metrics}")
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Evaluation (legacy inference path)
 # ---------------------------------------------------------------------------
 
 
@@ -685,6 +862,89 @@ def visualize_nvidia_clip(
         "num_frames": num_frames,
         "clip_id": clip_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# Inference on a raw mp4 + ego.jsonl (the 'special' folder) with a LoRA ckpt
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=training_image,
+    volumes=VOLUMES,
+    gpu="H100",
+    timeout=60 * 60 * 2,
+    cpu=8,
+    memory=32 * 1024,
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def visualize_special_predictions(
+    lora_name: str = "lora_best.pt",
+    video_rel: str = "special/front.mp4",
+    ego_rel: str = "special/ego.jsonl",
+    out_subdir: str = "special_predictions",
+    fov_deg: float = 70.0,
+    cam_height_m: float = 1.2,
+    frame_stride: int = 1,
+    max_frames: int | None = None,
+    output_fps: int = 30,
+    lora_rank: int = 32,
+    lora_alpha: int = 64,
+    lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj",
+) -> dict:
+    """Run SimLingo + a saved LoRA on a raw mp4 + ego.jsonl pair and produce a
+    camera+BEV side-by-side viz video.
+
+    Inputs (relative to /outputs):
+      - video_rel : the mp4
+      - ego_rel   : matching ego.jsonl
+
+    Output (under /outputs/<out_subdir>):
+      - predictions.mp4
+      - frames/frame_*.jpg
+      - summary.json
+    """
+    sys.path.insert(0, os.path.dirname(__file__))
+
+    from scripts.special_inference import run_special_inference
+
+    out_dir = Path(OUTPUTS_DIR) / out_subdir
+    video_path = Path(OUTPUTS_DIR) / video_rel
+    ego_path = Path(OUTPUTS_DIR) / ego_rel
+    if not video_path.exists():
+        raise FileNotFoundError(f"video not found at {video_path}")
+    if not ego_path.exists():
+        raise FileNotFoundError(f"ego.jsonl not found at {ego_path}")
+
+    ckpt_path = Path(CKPT_DIR) / HF_CKPT_FILE
+    hydra_cfg_path = Path(CKPT_DIR) / HF_HYDRA_CONFIG_FILE
+    lora_path = Path(CHECKPOINTS_DIR) / lora_name
+    if not lora_path.exists():
+        raise FileNotFoundError(f"LoRA checkpoint not found at {lora_path}")
+
+    lora_cfg = {
+        "rank": lora_rank,
+        "alpha": lora_alpha,
+        "target_modules": [m.strip() for m in lora_target_modules.split(",") if m.strip()],
+    }
+
+    summary = run_special_inference(
+        video_path=video_path,
+        ego_path=ego_path,
+        ckpt_path=ckpt_path,
+        hydra_cfg_path=hydra_cfg_path,
+        lora_path=lora_path,
+        lora_cfg=lora_cfg,
+        out_dir=out_dir,
+        fov_deg=fov_deg,
+        cam_height_m=cam_height_m,
+        frame_stride=frame_stride,
+        max_frames=max_frames,
+        output_fps=output_fps,
+    )
+    output_volume.commit()
+    print("[done]", summary)
+    return summary
 
 
 # ---------------------------------------------------------------------------

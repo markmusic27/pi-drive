@@ -33,6 +33,33 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
+
+# PROF_APPLIED_v1
+def _prof_mark(name, state):
+    """Profile helper: cuda-sync + record elapsed since last mark."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    now = time.perf_counter()
+    state[name] = now - state["_last"]
+    state["_last"] = now
+
+
+def _prof_log(path_prefix, step, is_main, prof):
+    """Print + wandb.log profile dict if rank-0. No-op otherwise."""
+    if not is_main:
+        return
+    if step % 5 != 0:
+        return
+    prof = {k: v for k, v in prof.items() if k != "_last"}
+    msg = " ".join(f"{k}={v*1000:.0f}ms" for k, v in prof.items())
+    print(f"[PROF {path_prefix} step={step}] {msg}", flush=True)
+    try:
+        import wandb as _wandb
+        _wandb.log({f"prof_{path_prefix}/{k}_ms": v * 1000 for k, v in prof.items()},
+                   step=step)
+    except Exception:
+        pass
+
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -476,6 +503,8 @@ class NVIDIASimLingoTrainer:
         hf_repo: str | None = None,
     ):
         self.config = config
+        # FOV_APPLIED_v1
+        self.fov_deg = float(config.get("data", {}).get("fov_deg", 120.0))
         self.ckpt_dir = Path(ckpt_dir)
         self.output_dir = Path(output_dir)
         self.hf_repo = hf_repo
@@ -493,10 +522,15 @@ class NVIDIASimLingoTrainer:
 
         if self.is_distributed:
             import torch.distributed as dist
-            if not dist.is_initialized():
-                dist.init_process_group(backend="nccl")
+            # CRITICAL ORDERING: set_device(local_rank) MUST come before
+            # init_process_group(backend="nccl"). NCCL otherwise grabs cuda:0 on
+            # every rank during init and locks the context — subsequent
+            # set_device(>=1) then fails with "CUDA-capable device(s) is/are
+            # busy or unavailable" on PyTorch 2.7+ (stricter than 2.4).
             torch.cuda.set_device(self.local_rank)
             self.device = torch.device(f"cuda:{self.local_rank}")
+            if not dist.is_initialized():
+                dist.init_process_group(backend="nccl")
             if self.is_main:
                 print(f"[DDP] world_size={self.world_size}, rank={self.rank}, "
                       f"local_rank={self.local_rank}, device={self.device}")
@@ -514,6 +548,7 @@ class NVIDIASimLingoTrainer:
         # Wrap model in DDP after LoRA injection so adapters are visible to DDP
         if self.is_distributed:
             from torch.nn.parallel import DistributedDataParallel as DDP
+            print(f"[rank{self.rank}] Wrapping model in DDP...", flush=True)
             # find_unused_parameters=True because only LoRA adapters have grads;
             # frozen base params would otherwise trigger DDP's "unused parameter" check.
             self.model = DDP(
@@ -523,21 +558,29 @@ class NVIDIASimLingoTrainer:
                 find_unused_parameters=True,
                 gradient_as_bucket_view=True,
             )
+            print(f"[rank{self.rank}] DDP wrap complete.", flush=True)
             # Keep an unwrapped handle for attribute access (.forward, custom methods)
             self._raw_model = self.model.module
         else:
             self._raw_model = self.model
 
         # Setup optimizer
+        print(f"[rank{self.rank}] Setting up optimizer...", flush=True)
         self._setup_optimizer()
+        print(f"[rank{self.rank}] Optimizer ready.", flush=True)
 
         # Setup dataloaders
+        print(f"[rank{self.rank}] Setting up dataloaders...", flush=True)
         self._setup_data()
+        print(f"[rank{self.rank}] Dataloaders ready (train batches={len(self.train_loader)}, val batches={len(self.val_loader)}).", flush=True)
 
         # Training state
         self.global_step = 0
         self.current_epoch = 0
         self.best_val_loss = float("inf")
+        # Early-stop bookkeeping (val/loss patience counter).
+        self._es_no_improve_count = 0
+        self._es_should_stop = False
 
     def _setup_model(self):
         """Load and prepare SimLingo model."""
@@ -1103,7 +1146,7 @@ class NVIDIASimLingoTrainer:
     ):
         """Build DrivingInput for a single sample."""
         H, W = HW
-        intrinsics = self.get_camera_intrinsics(W, H, 110).unsqueeze(0).to(self.device).float()
+        intrinsics = self.get_camera_intrinsics(W, H, self.fov_deg).unsqueeze(0).to(self.device).float()
         extrinsics = self.get_camera_extrinsics().unsqueeze(0).to(self.device).float()
 
         return self.DrivingInput(
@@ -1206,7 +1249,7 @@ class NVIDIASimLingoTrainer:
         """Build a single DrivingInput with [B, ...] tensors."""
         B = pixel_values_batch.shape[0]
         H, W = HW
-        K = self.get_camera_intrinsics(W, H, 110).to(self.device).float()        # [3, 3]
+        K = self.get_camera_intrinsics(W, H, self.fov_deg).to(self.device).float()        # [3, 3]
         E = self.get_camera_extrinsics().to(self.device).float()                  # [4, 4]
         intrinsics = K.unsqueeze(0).expand(B, -1, -1).contiguous()                # [B, 3, 3]
         extrinsics = E.unsqueeze(0).expand(B, -1, -1).contiguous()                # [B, 4, 4]
@@ -1238,6 +1281,7 @@ class NVIDIASimLingoTrainer:
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer not available - cannot build language labels")
 
+        _prof = {"_last": time.perf_counter()}
         # ----- Preprocess all images -----
         pixel_values_list = []
         HW_ref = None
@@ -1256,6 +1300,7 @@ class NVIDIASimLingoTrainer:
                 "set so max_num=1 is forced. Underlying error: " + str(e)
             )
 
+        _prof_mark("image_prep", _prof)
         num_patches = pixel_values_batch.shape[2]
         num_image_tokens = num_patches * 256
 
@@ -1267,16 +1312,19 @@ class NVIDIASimLingoTrainer:
             )
             for i in range(B)
         ]
+        _prof_mark("meta_actions", _prof)
         prompt_lls, prompt_inf_lls = self._build_batch_language_labels(
             batch["speed_mps"],
             batch["target_points"],
             num_image_tokens,
             meta_actions=meta_actions,
         )
+        _prof_mark("lang_label_build", _prof)
 
         # ----- Stack LanguageLabels into batched LanguageLabel -----
         prompt_ll_batched = self._build_batched_language_label(prompt_lls)
         prompt_inf_ll_batched = self._build_batched_language_label(prompt_inf_lls)
+        _prof_mark("lang_label_pad", _prof)
 
         # ----- Build batched DrivingInput -----
         driving_input = self._build_driving_input_batched(
@@ -1287,9 +1335,11 @@ class NVIDIASimLingoTrainer:
             prompt_inf_ll_batched,
             HW_ref,
         )
+        _prof_mark("driving_input", _prof)
 
         # ----- One forward pass for the whole batch -----
         speed_wps, route_wps, language = self.model(driving_input)
+        _prof_mark("forward", _prof)
 
         if self.use_mdn and self.mdn_head is not None:
             captured = self._last_features
@@ -1331,11 +1381,17 @@ class NVIDIASimLingoTrainer:
             gt_wps_aligned,
             gt_route,
         )
+        _prof_mark("loss_compute", _prof)
 
         # compute_loss already does mean reduction across batch, so we only
         # divide by grad_accum (not also by batch_size).
         loss_scaled = loss / grad_accum
         loss_scaled.backward()
+        _prof_mark("backward", _prof)
+        _prof_log("vec",
+                  getattr(self, "global_step", 0),
+                  getattr(self, "is_main", True),
+                  _prof)
 
         return {
             "total_loss": loss_dict["total_loss"],
@@ -1425,7 +1481,10 @@ class NVIDIASimLingoTrainer:
         total_route_loss = 0.0
         valid_samples = 0
 
+        _prof_totals = {"image_prep": 0.0, "lang_build": 0.0, "forward": 0.0,
+                        "loss_compute": 0.0, "backward": 0.0}
         for i in range(batch_size):
+            _prof_iter = {"_last": time.perf_counter()}
             try:
                 # Process single image
                 image = batch["image"][i]  # [3, H, W]
@@ -1445,6 +1504,7 @@ class NVIDIASimLingoTrainer:
 
                 # Process image for model
                 pixel_values, HW = self._process_single_image(image)
+                _prof_mark("image_prep", _prof_iter)
 
                 if self.global_step == 0 and i == 0:
                     print(f"  Processed image shape: {pixel_values.shape}, HW: {HW}")
@@ -1478,6 +1538,7 @@ class NVIDIASimLingoTrainer:
                 driving_input = self._build_driving_input_single(
                     pixel_values, speed, target_points, prompt_lls[0], prompt_inf_lls[0], HW
                 )
+                _prof_mark("lang_build", _prof_iter)
 
                 # --- Forward pass --------------------------------------------------
                 # Always run the full model forward (single pass). In MDN mode the
@@ -1530,6 +1591,7 @@ class NVIDIASimLingoTrainer:
                 if pred_wps is None:
                     print(f"Warning: Sample {i} - Model returned None for waypoints")
                     continue
+                _prof_mark("forward", _prof_iter)
 
                 # --- Shape alignment for the non-MDN path --------------------------
                 if isinstance(pred_wps, dict):
@@ -1556,8 +1618,13 @@ class NVIDIASimLingoTrainer:
 
                 # Backward pass for this sample (accumulate gradients)
                 # Scale by both batch_size and grad_accum for proper averaging
+                _prof_mark("loss_compute", _prof_iter)
                 loss_scaled = loss / (batch_size * grad_accum)
                 loss_scaled.backward()
+                _prof_mark("backward", _prof_iter)
+
+                for _k in ("image_prep", "lang_build", "forward", "loss_compute", "backward"):
+                    _prof_totals[_k] += _prof_iter.get(_k, 0.0)
 
                 total_wp_loss += loss_dict["wp_loss"]
                 total_route_loss += loss_dict["route_loss"]
@@ -1569,6 +1636,12 @@ class NVIDIASimLingoTrainer:
                 if self.global_step == 0:
                     traceback.print_exc()
                 continue
+
+        _prof_totals["_last"] = 0.0  # satisfy _prof_log contract
+        _prof_log("unvec",
+                  getattr(self, "global_step", 0),
+                  getattr(self, "is_main", True),
+                  _prof_totals)
 
         # If no valid samples, return zero loss
         if valid_samples == 0:
@@ -1681,7 +1754,7 @@ class NVIDIASimLingoTrainer:
                                     rgb_img = np.transpose(img, (1, 2, 0))
 
                                 H, W = rgb_img.shape[:2]
-                                K = self.get_camera_intrinsics(W, H, 110).cpu().numpy()
+                                K = self.get_camera_intrinsics(W, H, self.fov_deg).cpu().numpy()
                                 gt_np = gt_wps_aligned[0].cpu().numpy()
                                 pred_np = pred_wps_aligned[0].cpu().numpy()
 
@@ -1743,6 +1816,9 @@ class NVIDIASimLingoTrainer:
         logging_steps = self.config["training"]["logging_steps"]
         eval_steps = self.config["training"]["eval_steps"]
         save_steps = self.config["training"]["save_steps"]
+        es_enabled = bool(self.config["training"].get("early_stopping", False))
+        es_patience = int(self.config["training"].get("early_stopping_patience", 3))
+        es_min_delta = float(self.config["training"].get("early_stopping_min_delta", 1e-4))
 
         print(f"Starting training for {epochs} epochs")
         print(f"  Total steps: {len(self.train_loader) * epochs // grad_accum}")
@@ -1755,7 +1831,14 @@ class NVIDIASimLingoTrainer:
         ema_loss = None
         ema_alpha = 0.1  # Smoothing factor
 
-        for epoch in range(epochs):
+        # Honor resume: skip epochs already finished in the loaded checkpoint.
+        # `_resume_start_epoch` is set by load_checkpoint(); defaults to 0.
+        start_epoch = getattr(self, "_resume_start_epoch", 0)
+        if start_epoch > 0 and getattr(self, "is_main", True):
+            print(f"[resume] skipping {start_epoch} completed epoch(s); "
+                  f"starting at epoch {start_epoch + 1}/{epochs}")
+
+        for epoch in range(start_epoch, epochs):
             self.current_epoch = epoch
             self.model.train()
 
@@ -1848,6 +1931,17 @@ class NVIDIASimLingoTrainer:
                     if self.global_step % save_steps == 0 and getattr(self, 'is_main', True):
                         self.save_checkpoint(f"step_{self.global_step}")
 
+                    # Proactive (out-of-band) checkpoint request: poll the
+                    # checkpoint volume for a SAVE_NOW sentinel every 10 steps.
+                    # Sentinels are dropped by `request_checkpoint` (see
+                    # modal_training.py). Rank 0 only — save_checkpoint already
+                    # uses the unwrapped model.
+                    if (
+                        getattr(self, 'is_main', True)
+                        and self.global_step % 10 == 0
+                    ):
+                        self._check_save_request()
+
             # End of epoch
             avg_epoch_loss = np.mean(epoch_losses) if epoch_losses else 0.0
             if getattr(self, 'is_main', True):
@@ -1863,19 +1957,98 @@ class NVIDIASimLingoTrainer:
                     "val/loss": val_metrics["val_loss"],
                     "val/wp_loss": val_metrics.get("val_wp_loss", 0.0),
                     "val/route_loss": val_metrics.get("val_route_loss", 0.0),
+                    "val/best_loss": self.best_val_loss,
+                    "val/es_patience_remaining": max(0, es_patience - self._es_no_improve_count),
                     "epoch": epoch + 1,
                 }, step=self.global_step)
                 print(f"Epoch {epoch + 1} val loss: {val_metrics['val_loss']:.4f}")
 
-                # Save best checkpoint
-                if val_metrics["val_loss"] < self.best_val_loss:
+                # Save best checkpoint + early-stop bookkeeping
+                improved = val_metrics["val_loss"] < (self.best_val_loss - es_min_delta)
+                if improved:
                     self.best_val_loss = val_metrics["val_loss"]
                     self.save_checkpoint("best")
+                    self._es_no_improve_count = 0
+                else:
+                    self._es_no_improve_count += 1
+                    if es_enabled:
+                        print(
+                            f"  [early-stop] no improvement for "
+                            f"{self._es_no_improve_count}/{es_patience} epochs "
+                            f"(best={self.best_val_loss:.4f}, cur={val_metrics['val_loss']:.4f})"
+                        )
 
                 # Always save end-of-epoch checkpoint
                 self.save_checkpoint(f"epoch_{epoch + 1}")
 
-        return {"final_loss": all_metrics[-1]["loss"] if all_metrics else 0.0}
+                # Decide early stop on rank 0; broadcast to other ranks below.
+                if es_enabled and self._es_no_improve_count >= es_patience:
+                    self._es_should_stop = True
+                    print(
+                        f"  [early-stop] triggered after epoch {epoch + 1} "
+                        f"(best val/loss={self.best_val_loss:.4f})"
+                    )
+
+            # Broadcast the stop decision across DDP ranks so all peers exit
+            # the epoch loop together (otherwise NCCL hangs on next collective).
+            if getattr(self, 'is_distributed', False):
+                import torch.distributed as dist
+                flag = torch.tensor(
+                    [1 if self._es_should_stop else 0],
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                dist.broadcast(flag, src=0)
+                self._es_should_stop = bool(flag.item())
+
+            if self._es_should_stop:
+                break
+
+        return {
+            "final_loss": all_metrics[-1]["loss"] if all_metrics else 0.0,
+            "best_val_loss": self.best_val_loss,
+            "early_stopped": self._es_should_stop,
+            "epochs_completed": self.current_epoch + 1,
+        }
+
+    def _check_save_request(self) -> None:
+        """Look for SAVE_NOW sentinel files in output_dir and trigger an
+        out-of-band checkpoint save when found.
+
+        Sentinels are dropped by the `request_checkpoint` Modal function in
+        a separate container. To make those writes visible inside the
+        long-running training container we `reload()` the Modal volume
+        first. After saving we delete the sentinel and `commit()` so the
+        new checkpoint is visible to downstream readers.
+
+        Safe to call from rank 0 only — silently no-ops outside Modal.
+        """
+        try:
+            try:
+                import modal
+                _vol = modal.Volume.from_name("simlingo-checkpoints")
+                _vol.reload()
+            except Exception:
+                _vol = None
+
+            for sentinel in sorted(self.output_dir.glob("SAVE_NOW*")):
+                tag = sentinel.name[len("SAVE_NOW"):].lstrip(".") or (
+                    f"manual_step_{self.global_step}"
+                )
+                print(f"[manual-ckpt] sentinel '{sentinel.name}' -> saving as '{tag}'")
+                self.save_checkpoint(tag)
+                try:
+                    sentinel.unlink()
+                except FileNotFoundError:
+                    pass
+                if _vol is not None:
+                    try:
+                        _vol.commit()
+                    except Exception as e:
+                        print(f"[manual-ckpt] commit warning: {e}")
+        except Exception as e:
+            # Polling failure should never break training.
+            print(f"[manual-ckpt] poll error (non-fatal): {e}")
 
     def save_checkpoint(self, name: str) -> Path:
         """Save model checkpoint with LoRA weights and MDN head."""
@@ -1949,35 +2122,71 @@ class NVIDIASimLingoTrainer:
             self.best_val_loss = state["best_val_loss"]
             self.optimizer.load_state_dict(state["optimizer"])
             self.scheduler.load_state_dict(state["scheduler"])
+            # Skip epochs already completed. `current_epoch` is the index of
+            # the epoch that was active when the checkpoint was saved, and
+            # save_checkpoint(f"epoch_{epoch+1}") is called at end-of-epoch,
+            # so on resume we start from current_epoch + 1.
+            self._resume_start_epoch = self.current_epoch + 1
+        else:
+            self._resume_start_epoch = 0
 
         print(f"Loaded checkpoint from {path}")
 
     def push_to_hub(self, repo_id: str):
-        """Push LoRA weights to HuggingFace Hub."""
-        from huggingface_hub import HfApi, upload_file
+        """Push final + best LoRA weights to HuggingFace Hub.
+
+        Creates the repo if it doesn't exist (honoring `hub.private` from config).
+        Uploads `lora_final.pt` and (if present) `lora_best.pt`. Optimizer state
+        is intentionally NOT pushed (too large for HF, store on Modal volume).
+        """
+        from huggingface_hub import HfApi
+
+        hub_cfg = self.config.get("hub", {}) if isinstance(self.config, dict) else {}
+        private = bool(hub_cfg.get("private", True))
+        push_best = bool(hub_cfg.get("push_best_checkpoint", True))
 
         api = HfApi()
 
-        # Save LoRA weights
-        lora_path = self.output_dir / "lora_final.pt"
-        _src_model = getattr(self, '_raw_model', self.model)
-        lora_state = {}
-        for key, value in _src_model.state_dict().items():
-            if "lora_A_" in key or "lora_B_" in key:
-                lora_state[key] = value
-        torch.save(lora_state, lora_path)
-
-        # Upload to HF Hub
+        # Ensure the repo exists (idempotent).
         try:
-            api.upload_file(
-                path_or_fileobj=str(lora_path),
-                path_in_repo="lora_weights.pt",
+            api.create_repo(
                 repo_id=repo_id,
                 repo_type="model",
+                private=private,
+                exist_ok=True,
             )
-            print(f"Pushed LoRA weights to {repo_id}")
         except Exception as e:
-            print(f"Failed to push to hub: {e}")
+            print(f"create_repo({repo_id}) raised: {e} — attempting upload anyway")
+
+        # (Re-)write lora_final.pt from current weights so we always push the
+        # freshest LoRA state at end-of-training.
+        final_path = self.output_dir / "lora_final.pt"
+        _src_model = getattr(self, "_raw_model", self.model)
+        final_state = {
+            k: v for k, v in _src_model.state_dict().items()
+            if ("lora_A_" in k or "lora_B_" in k)
+        }
+        torch.save(final_state, final_path)
+
+        targets = [(final_path, "lora_final.pt")]
+        if push_best:
+            best_path = self.output_dir / "lora_best.pt"
+            if best_path.exists():
+                targets.append((best_path, "lora_best.pt"))
+            else:
+                print("  [hub] lora_best.pt not found; skipping best-ckpt upload")
+
+        for src, dst in targets:
+            try:
+                api.upload_file(
+                    path_or_fileobj=str(src),
+                    path_in_repo=dst,
+                    repo_id=repo_id,
+                    repo_type="model",
+                )
+                print(f"  [hub] uploaded {src.name} -> {repo_id}:{dst}")
+            except Exception as e:
+                print(f"  [hub] failed to upload {src.name}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1990,7 +2199,8 @@ def main():
     parser.add_argument("--config", required=True, help="Path to config YAML")
     parser.add_argument("--output-dir", default="/checkpoints", help="Output directory")
     parser.add_argument("--wandb-project", default="simlingo-nvidia-finetune")
-    parser.add_argument("--hf-repo", help="HuggingFace repo for checkpoint upload")
+    parser.add_argument("--hf-repo", help="HuggingFace repo for checkpoint upload (overrides hub.repo_id in config)")
+    parser.add_argument("--resume-from", help="Path to a checkpoint to resume training from")
 
     args = parser.parse_args()
 
@@ -2007,7 +2217,29 @@ def main():
 
     # Initialize W&B on rank 0 only; non-main ranks disable wandb entirely.
     if _is_main_entry:
-        wandb.init(project=args.wandb_project, config=config)
+        _wandb_cfg = config.get("wandb", {}) if isinstance(config, dict) else {}
+        _world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        _tags = [
+            f"world_size={_world_size}",
+            f"vectorized={config.get('training', {}).get('vectorized', False)}",
+            f"epochs={config.get('training', {}).get('epochs', 'na')}",
+            f"bs={config.get('training', {}).get('batch_size', 'na')}",
+            f"lr={config.get('training', {}).get('learning_rate', 'na')}",
+        ]
+        wandb.init(
+            project=args.wandb_project,
+            entity=_wandb_cfg.get("entity"),
+            config=config,
+            tags=_tags,
+            save_code=True,  # Snapshot the trainer.py + config in W&B
+        )
+        # Define metric step axis so val/* and train/* align on the same _step.
+        try:
+            wandb.define_metric("train/*", step_metric="_step")
+            wandb.define_metric("val/*", step_metric="_step", summary="min")
+            wandb.define_metric("val/loss", summary="min")
+        except Exception:
+            pass
     else:
         os.environ["WANDB_MODE"] = "disabled"
         wandb.init(mode="disabled")
@@ -2015,23 +2247,38 @@ def main():
     # Get checkpoint directory from environment or default
     ckpt_dir = os.environ.get("CKPT_DIR", "/data/checkpoint")
 
+    # Resolve HF repo: CLI flag overrides config.hub.repo_id.
+    _hub_cfg = config.get("hub", {}) if isinstance(config, dict) else {}
+    _resolved_hf_repo = args.hf_repo or (
+        _hub_cfg.get("repo_id") if _hub_cfg.get("push_to_hub") else None
+    )
+
     # Create trainer
     trainer = NVIDIASimLingoTrainer(
         config=config,
         ckpt_dir=ckpt_dir,
         output_dir=args.output_dir,
-        hf_repo=args.hf_repo,
+        hf_repo=_resolved_hf_repo,
     )
 
-    # Train
+    # Optional: resume from a prior checkpoint.
+    if args.resume_from:
+        trainer.load_checkpoint(args.resume_from)
+        if _is_main_entry:
+            print(f"Resumed from {args.resume_from} at step {trainer.global_step}")
+
+    # Train (may early-stop based on config.training.early_stopping).
     metrics = trainer.train()
+    if _is_main_entry:
+        print(f"Training finished: {metrics}")
 
     # Save final
-    trainer.save_checkpoint("final")
+    if _is_main_entry:
+        trainer.save_checkpoint("final")
 
-    # Push to hub if configured (rank 0 only)
-    if args.hf_repo and _is_main_entry:
-        trainer.push_to_hub(args.hf_repo)
+    # Push to hub if configured (rank 0 only). CLI takes precedence over config.
+    if _resolved_hf_repo and _is_main_entry:
+        trainer.push_to_hub(_resolved_hf_repo)
 
     if _is_main_entry:
         wandb.finish()

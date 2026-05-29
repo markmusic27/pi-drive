@@ -18,10 +18,13 @@ model:
   route_spacing_m: 1.0
 
 training:
-  # Batch configuration (matching SteerVLA effective batch size)
-  batch_size: 48
+  # Batch configuration — sized for H100:8.
+  # Per-rank bs=24, 8 ranks, grad_accum=4 → effective batch = 24*8*4 = 768.
+  # This matches the convergence-per-step of the prior H100:4 setup (48*4*4=768)
+  # while halving wallclock by doubling data-parallel ranks.
+  batch_size: 24
   gradient_accumulation_steps: 4
-  effective_batch_size: 192  # 48 * 4 = 192 (same as SteerVLA)
+  effective_batch_size: 768  # 24 * 8 * 4 = 768
 
   # Training duration
   epochs: 20
@@ -44,20 +47,27 @@ training:
   max_grad_norm: 1.0
 
   # Tier A vectorization: single batched forward+backward per step instead of
-  # per-sample loop. Validated 2026-05-18 on tiny smoke against the per-sample
-  # path: val/loss within 0.25% (5.213 vec vs 5.200 unvec). Forces max_num=1
-  # in dynamic_preprocess to guarantee P=1 for clean stacking.
+  # per-sample loop. Steady-state profile (2026-05-18, H100:4, bs=48):
+  #   vec   step ~22.1s (image_prep 1.7 + forward 17.2 + backward 3.1)
+  #   unvec step ~25.3s (image_prep 1.4 + forward 16.7 + backward 6.9)
+  # Vec backward is 55% faster (one batched bwd vs N per-sample bwds), more than
+  # offsetting a slight forward regression. Numerical equivalence confirmed
+  # (val/loss delta 0.25% on smoke). max_num=1 is forced for clean stacking;
+  # see Phase 2 follow-up for variable-patch fix if accuracy plateaus.
   vectorized: true
 
-  # Evaluation
-  eval_steps: 500
-  save_steps: 500
+  # Evaluation — denser eval/save cadence so early-stop has tight resume granularity.
+  eval_steps: 250
+  save_steps: 250
   logging_steps: 10
 
-  # Early stopping
-  early_stopping: false
-  early_stopping_patience: 5
+  # Early stopping: monitor val/loss, halt if no improvement after `patience`
+  # evaluations. Combined with frequent checkpointing, you can also manually
+  # `modal app stop <id>` at any time and resume from the latest checkpoint.
+  early_stopping: true
+  early_stopping_patience: 3
   early_stopping_metric: val/loss
+  early_stopping_min_delta: 1.0e-4
 
 lora:
   enabled: true
@@ -74,9 +84,9 @@ lora:
   vision_rank: 16
 
 data:
-  # Paths (will be set by training script)
-  train_dir: null  # e.g., /nvidia_data/extracted
-  val_dir: null    # If null, uses val split from train_dir
+  # Paths inside the Modal container (mounted from simlingo-nvidia-data volume).
+  train_dir: "/nvidia_data/extracted"
+  val_dir: null    # null = use val split from train_dir via train_val_split.json
   val_split: 0.1
 
   # Image preprocessing
@@ -130,13 +140,21 @@ wandb:
   project: "simlingo-nvidia-finetune"
   entity: null  # Will use default entity
   log_interval: 10
-  save_artifacts: true
+  save_artifacts: true            # Upload LoRA checkpoints as W&B artifacts
+  log_gradients: false            # Set true to track per-param grad norms (slow)
+  watch_model: false              # wandb.watch can balloon log volume on DDP
+  log_predictions_every: 250      # Push BEV + camera projection viz every N steps
+  log_system_metrics: true        # CPU/GPU/mem utilization (Modal nodes)
 
-# HuggingFace Hub settings
+# HuggingFace Hub settings — final + best LoRA weights are uploaded at end of
+# training. Repo is auto-created if it doesn't exist. Override repo_id at the
+# CLI with `--hf-repo <repo>` to avoid editing this file.
 hub:
-  push_to_hub: false
-  repo_id: null  # e.g., "your-username/simlingo-nvidia"
+  push_to_hub: true
+  repo_id: "markmusic/simlingo-nvidia"
   private: true
+  push_best_checkpoint: true   # Also push best-val checkpoint, not just final
+  push_training_state: false   # Optimizer/scheduler state is too large for HF
 
 # Distributed training settings
 distributed:

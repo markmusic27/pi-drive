@@ -156,6 +156,10 @@ def _quantize_w4a8_bnb(
             if "embed" in n or "lm_head" in n or "wte" in n or "wpe" in n:
                 return False
 
+        # Never quantize LoRA adapter matrices — see INT8 path for rationale.
+        if "lora_" in n:
+            return False
+
         if "language_model" in n:
             return quantize_llm
         if quantize_vision and "vision_model" in n and "language_model" not in n:
@@ -300,6 +304,12 @@ def _quantize_int8(
         if keep_embedding_fp16:
             if "embed" in n or "lm_head" in n or "wte" in n or "wpe" in n:
                 return False
+
+        # CRITICAL: never quantize LoRA adapter matrices (lora_A / lora_B).
+        # They are rank-8/16 and (a) gain ~nothing from int8, (b) their int8
+        # outputs break the LoRA residual sum inside the wrapper layer.
+        if "lora_" in n:
+            return False
 
         # Actual LLM path inside InternVL2 (e.g. "*.language_model.layers.N.*")
         if "language_model" in n:

@@ -46,6 +46,9 @@ training:
   gradient_checkpointing: false
   max_grad_norm: 1.0
 
+  # Validate vec path on new B200 image (this is the production code path).
+  vectorized: true
+
   # Frequent eval/save so we can see early signal
   eval_steps: 10
   save_steps: 25
