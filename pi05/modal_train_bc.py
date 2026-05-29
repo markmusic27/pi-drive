@@ -82,6 +82,9 @@ def train_bc(
     # Patch openpi with our driving config
     _patch_openpi()
 
+    # Convert v3.0 dataset to v2.1 format for openpi's bundled lerobot
+    _convert_dataset_v3_to_v21("markmusic/pi05-physical-av-bc")
+
     checkpoint_dir = f"{CACHE_DIR}/checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -145,7 +148,7 @@ def train_bc(
 def upload_checkpoint(
     step: int | None = None,
     exp_name: str = "bc-coldstart",
-    repo_id: str = "markmusic/pi05-driving-bc-checkpoint",
+    repo_id: str = "markmusic/pi05-physical-av-bc-checkpoint",
 ):
     import os
 
@@ -189,6 +192,84 @@ def upload_checkpoint(
         commit_message=f"Checkpoint at step {step}",
     )
     print(f"Uploaded to https://huggingface.co/{repo_id}")
+
+
+# ---------------------------------------------------------------------------
+# Convert LeRobot v3.0 dataset to v2.1 for openpi compatibility
+# ---------------------------------------------------------------------------
+
+
+def _convert_dataset_v3_to_v21(repo_id: str):
+    """Download dataset from HF and convert v3.0 format to v2.1.
+
+    openpi bundles lerobot 0.1.0 (Python 3.11) which expects v2.0/v2.1 format.
+    Our dataset was built with lerobot 0.5.x which produces v3.0.
+    Key differences: v2.1 uses tasks.jsonl, v3.0 uses tasks.parquet.
+    """
+    import json
+    import os
+    import subprocess
+
+    dataset_dir = f"{CACHE_DIR}/hf/lerobot/{repo_id}"
+
+    # Download from HF if not already cached
+    if not os.path.exists(dataset_dir):
+        print(f"Downloading dataset {repo_id} from HuggingFace...")
+        subprocess.run(
+            ["huggingface-cli", "download", repo_id,
+             "--repo-type", "dataset",
+             "--local-dir", dataset_dir],
+            check=True,
+        )
+
+    meta_dir = os.path.join(dataset_dir, "meta")
+    info_path = os.path.join(meta_dir, "info.json")
+    tasks_parquet = os.path.join(meta_dir, "tasks.parquet")
+    tasks_jsonl = os.path.join(meta_dir, "tasks.jsonl")
+
+    if not os.path.exists(info_path):
+        print(f"No info.json found at {info_path}, skipping conversion")
+        return
+
+    with open(info_path) as f:
+        info = json.load(f)
+
+    if info.get("codebase_version") != "v3.0":
+        print(f"Dataset already in {info.get('codebase_version')} format")
+        return
+
+    print(f"Converting dataset from v3.0 to v2.1...")
+
+    # Convert tasks.parquet → tasks.jsonl
+    if os.path.exists(tasks_parquet) and not os.path.exists(tasks_jsonl):
+        import pyarrow.parquet as pq
+        table = pq.read_table(tasks_parquet)
+        with open(tasks_jsonl, "w") as f:
+            for i in range(table.num_rows):
+                row = {col: table.column(col)[i].as_py() for col in table.column_names}
+                f.write(json.dumps(row) + "\n")
+        print(f"  Created tasks.jsonl with {table.num_rows} tasks")
+
+    # Convert episodes parquet → episodes.jsonl
+    episodes_parquet = os.path.join(meta_dir, "episodes", "chunk-000", "file-000.parquet")
+    episodes_jsonl = os.path.join(meta_dir, "episodes.jsonl")
+    if os.path.exists(episodes_parquet) and not os.path.exists(episodes_jsonl):
+        import pyarrow.parquet as pq
+        table = pq.read_table(episodes_parquet)
+        with open(episodes_jsonl, "w") as f:
+            for i in range(table.num_rows):
+                row = {col: table.column(col)[i].as_py() for col in table.column_names}
+                f.write(json.dumps(row) + "\n")
+        print(f"  Created episodes.jsonl with {table.num_rows} episodes")
+
+    # Update info.json to v2.1
+    info["codebase_version"] = "v2.1"
+    with open(info_path, "w") as f:
+        json.dump(info, f, indent=2)
+    print(f"  Updated info.json codebase_version to v2.1")
+
+    cache_volume.commit()
+    print("Dataset conversion complete")
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +439,7 @@ class LeRobotDrivingDataConfig(DataConfigFactory):
             action_expert_variant="gemma_300m",
         ),
         data=LeRobotDrivingDataConfig(
-            repo_id="markmusic/pi05-driving-bc",
+            repo_id="markmusic/pi05-physical-av-bc",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(

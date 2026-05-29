@@ -44,7 +44,7 @@ app = modal.App(APP_NAME)
 )
 def build_lerobot_dataset(
     scale: str = "tiny",
-    repo_id: str = "markmusic/pi05-driving-bc",
+    repo_id: str = "markmusic/pi05-physical-av-bc",
     push: bool = True,
 ):
     import json
