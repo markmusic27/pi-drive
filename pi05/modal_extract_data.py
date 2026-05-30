@@ -129,41 +129,124 @@ def _trajectory_to_nav_prompt(ego_future_xyz):
 
 def _filter_clips(avdi):
     """Filter clip_index for right-hand-traffic, daytime, valid sensors."""
-    import os
     import pandas as pd
 
     clip_index = avdi.clip_index.copy()
+    all_clip_ids = set(clip_index.index.tolist())
+    valid_clips = all_clip_ids
 
+    # Use avdi's built-in data_collection DataFrame
     try:
-        metadata_dir = os.path.dirname(avdi._clip_index_path)
-        dc_path = os.path.join(metadata_dir, "data_collection.parquet")
-        fp_path = os.path.join(metadata_dir, "metadata", "feature_presence.parquet")
+        dc = avdi.data_collection
+        print(f"  data_collection: {len(dc)} rows, columns: {dc.columns.tolist()}")
 
-        if os.path.exists(dc_path):
-            metadata = pd.read_parquet(dc_path)
-            filtered = metadata[
-                (metadata["country"].isin(RIGHT_HAND_TRAFFIC))
-                & (metadata["time_of_day"] == "daytime")
-            ]
-            valid_clips = set(filtered["clip_id"].tolist())
-            print(f"  Country+daylight filter: {len(valid_clips)} clips")
+        # Find the country column (might be 'country' or 'Country' etc.)
+        country_col = None
+        tod_col = None
+        for col in dc.columns:
+            if col.lower() == "country":
+                country_col = col
+            if col.lower() in ("time_of_day", "timeofday", "tod"):
+                tod_col = col
+
+        filters = pd.Series(True, index=dc.index)
+
+        if country_col:
+            filters &= dc[country_col].isin(RIGHT_HAND_TRAFFIC)
+            print(f"  Country filter ({country_col}): {filters.sum()} clips")
+
+        if tod_col:
+            filters &= dc[tod_col] == "daytime"
+            print(f"  + Daylight filter ({tod_col}): {filters.sum()} clips")
+
+        # hour_of_day: filter for daytime hours (8 AM - 6 PM)
+        hour_col = None
+        for col in dc.columns:
+            if col.lower() in ("hour_of_day", "hour"):
+                hour_col = col
+        if hour_col and not tod_col:
+            filters &= dc[hour_col].between(8, 18)
+            print(f"  + Daylight filter ({hour_col} 8-18): {filters.sum()} clips")
+
+        # clip_id may be a column or the index
+        if "clip_id" in dc.columns:
+            filtered_ids = set(dc.loc[filters, "clip_id"].tolist())
         else:
-            valid_clips = set(clip_index.index.tolist())
-            print("  No data_collection.parquet, skipping country/daylight filter")
-
-        if os.path.exists(fp_path):
-            features = pd.read_parquet(fp_path)
-            has_sensors = features[
-                (features.get("has_egomotion", True) == True)
-                & (features.get("has_camera_front_wide", True) == True)
-            ]
-            valid_clips &= set(has_sensors["clip_id"].tolist())
-            print(f"  Sensor filter: {len(valid_clips)} clips")
+            filtered_ids = set(dc.index[filters].tolist())
+        valid_clips = filtered_ids & all_clip_ids
+        print(f"  Country+daylight filter: {len(valid_clips)} clips")
     except Exception as e:
-        print(f"  Warning: metadata filtering failed ({e}), using all clips")
-        valid_clips = set(clip_index.index.tolist())
+        print(f"  Warning: data_collection filter failed ({e})")
 
-    return [c for c in clip_index.index if c in valid_clips]
+    # Use avdi's feature_presence for sensor filtering
+    try:
+        fp = avdi.feature_presence
+        print(f"  feature_presence: {len(fp)} rows, columns: {fp.columns.tolist()[:20]}")
+
+        ego_col = None
+        cam_col = None
+        for col in fp.columns:
+            if col.lower() in ("egomotion", "egomotion.offline"):
+                ego_col = ego_col or col
+            if "camera_front_wide" in col.lower() or "front_wide" in col.lower():
+                cam_col = cam_col or col
+
+        if ego_col and cam_col:
+            has_data = fp[(fp[ego_col] == True) & (fp[cam_col] == True)]
+            if "clip_id" in fp.columns:
+                sensor_ids = set(has_data["clip_id"].tolist())
+            else:
+                sensor_ids = set(has_data.index.tolist())
+            valid_clips &= sensor_ids
+            print(f"  Sensor filter ({ego_col}, {cam_col}): {len(valid_clips)} clips")
+        elif ego_col:
+            has_data = fp[fp[ego_col] == True]
+            if "clip_id" in fp.columns:
+                sensor_ids = set(has_data["clip_id"].tolist())
+            else:
+                sensor_ids = set(has_data.index.tolist())
+            valid_clips &= sensor_ids
+            print(f"  Sensor filter ({ego_col} only): {len(valid_clips)} clips")
+    except Exception as e:
+        print(f"  Warning: feature_presence filter failed ({e})")
+
+    result = [c for c in clip_index.index if c in valid_clips]
+    print(f"  Final: {len(result)} clips pass all filters")
+    return result
+
+
+def _load_with_retry(clip_id, t0_us, avdi, max_retries=3):
+    """Load clip data with exponential backoff on 429/timeout errors."""
+    import glob
+    import os
+    import time
+    from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
+
+    for attempt in range(max_retries):
+        try:
+            return load_physical_aiavdataset(
+                clip_id,
+                t0_us=t0_us,
+                avdi=avdi,
+                maybe_stream=True,
+                camera_features=[avdi.features.CAMERA.CAMERA_FRONT_WIDE_120FOV],
+                num_frames=1,
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            retryable = "429" in msg or "too many requests" in msg or "timeout" in msg or "file is not a zip" in msg
+            if retryable and attempt < max_retries - 1:
+                # If bad zip, purge any locally cached zip files for this clip
+                if "zip" in msg:
+                    hf_home = os.environ.get("HF_HOME", "")
+                    if hf_home:
+                        for zf in glob.glob(f"{hf_home}/hub/**/*.zip", recursive=True):
+                            if clip_id in zf:
+                                os.remove(zf)
+                wait = 2 ** (attempt + 1) + (attempt * 2)
+                time.sleep(wait)
+                continue
+            raise
 
 
 def _process_clips(clip_ids, eval_clip_set, scale, avdi=None):
@@ -172,14 +255,13 @@ def _process_clips(clip_ids, eval_clip_set, scale, avdi=None):
     import numpy as np
     from PIL import Image
 
-    from alpamayo_r1.action_space.unicycle_accel_curvature import (
-        UnicycleAccelCurvatureActionSpace,
-    )
-    from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
-
     if avdi is None:
         import physical_ai_av
         avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
+
+    from alpamayo_r1.action_space.unicycle_accel_curvature import (
+        UnicycleAccelCurvatureActionSpace,
+    )
 
     action_space = UnicycleAccelCurvatureActionSpace()
     output_dir = f"{CACHE_DIR}/extracted/{scale}"
@@ -193,14 +275,7 @@ def _process_clips(clip_ids, eval_clip_set, scale, avdi=None):
         for t0_us in T0_OFFSETS_US:
             sample_id = f"{clip_id}_{t0_us}"
             try:
-                data = load_physical_aiavdataset(
-                    clip_id,
-                    t0_us=t0_us,
-                    avdi=avdi,
-                    maybe_stream=True,
-                    camera_features=[avdi.features.CAMERA.CAMERA_FRONT_WIDE_120FOV],
-                    num_frames=1,
-                )
+                data = _load_with_retry(clip_id, t0_us, avdi)
 
                 ego_hist = data["ego_history_xyz"][0, 0].numpy()
                 velocities = np.linalg.norm(np.diff(ego_hist, axis=0), axis=1) / dt
@@ -271,6 +346,7 @@ def _process_clips(clip_ids, eval_clip_set, scale, avdi=None):
     timeout=60 * 60 * 2,
     memory=32 * 1024,
     secrets=[modal.Secret.from_name("huggingface")],
+    max_containers=3,
 )
 def _extract_clip_batch(
     clip_ids: list[str],
@@ -278,19 +354,73 @@ def _extract_clip_batch(
     scale: str,
     batch_idx: int,
 ) -> dict:
-    """Process a batch of clips. Called in parallel by extract_parallel."""
+    """Process a batch of clips. Called in parallel by extract_parallel.
+
+    Uses a LOCAL HF cache (copied from shared volume metadata) so that
+    429 error responses from HuggingFace never poison the shared cache.
+    Only extracted images are written to the shared volume.
+    """
+    import os
+    import shutil
+    import tempfile
     import time
+    from collections import Counter
+
+    # --- LOCAL HF CACHE ---
+    # Copy pre-cached metadata from shared volume to a local temp dir.
+    # Workers download clip data into this local dir (ephemeral, per-container).
+    # This prevents 429 error pages from corrupting the shared volume cache.
+    local_hf = tempfile.mkdtemp(prefix="hf_local_")
+    shared_hf = f"{CACHE_DIR}/hf"
+
+    if os.path.isdir(shared_hf):
+        # Selectively copy: only non-zip files (metadata CSVs, parquets, configs).
+        # Skip zip/blob files to keep the copy fast.
+        shared_hub = os.path.join(shared_hf, "hub")
+        if os.path.isdir(shared_hub):
+            n_copied = 0
+            for dirpath, dirnames, filenames in os.walk(shared_hub):
+                for fname in filenames:
+                    if fname.endswith(".zip"):
+                        continue
+                    src = os.path.join(dirpath, fname)
+                    rel = os.path.relpath(src, shared_hf)
+                    dst = os.path.join(local_hf, rel)
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy2(src, dst)
+                    n_copied += 1
+            print(f"Batch {batch_idx}: copied {n_copied} metadata files to local HF dir")
+        else:
+            print(f"Batch {batch_idx}: no shared hub cache found, starting fresh")
+    else:
+        print(f"Batch {batch_idx}: no shared HF dir found, starting fresh")
+
+    os.environ["HF_HOME"] = local_hf
 
     t0 = time.time()
     eval_set = set(eval_clip_ids)
     samples, errors = _process_clips(clip_ids, eval_set, scale)
+
+    # Only commit the shared volume (images written to CACHE_DIR/extracted/)
     cache_volume.commit()
+
+    # Clean up local HF cache (container-local, ephemeral)
+    shutil.rmtree(local_hf, ignore_errors=True)
 
     elapsed = time.time() - t0
     rate = len(clip_ids) / elapsed if elapsed > 0 else 0
+
+    if errors:
+        error_types = Counter(e["error"][:80] for e in errors)
+        top_errors = error_types.most_common(3)
+        error_summary = "; ".join(f"{msg}({n})" for msg, n in top_errors)
+    else:
+        error_summary = "none"
+
     print(
         f"Batch {batch_idx}: {len(clip_ids)} clips → {len(samples)} samples, "
-        f"{len(errors)} errors, {elapsed:.0f}s ({rate:.1f} clips/s)"
+        f"{len(errors)} errors, {elapsed:.0f}s ({rate:.1f} clips/s) "
+        f"[{error_summary}]"
     )
     return {"samples": samples, "errors": errors}
 
@@ -299,7 +429,7 @@ def _extract_clip_batch(
     image=extract_image,
     volumes=VOLUMES,
     gpu="T4",
-    timeout=60 * 60 * 4,
+    timeout=60 * 60 * 12,
     memory=32 * 1024,
     secrets=[modal.Secret.from_name("huggingface")],
 )
@@ -307,7 +437,7 @@ def extract_parallel(
     scale: str = "large",
     seed: int = 42,
     eval_frac: float = 0.1,
-    batch_size: int = 100,
+    batch_size: int = 200,
 ):
     """Parallel extraction across many Modal containers."""
     import os
@@ -340,34 +470,73 @@ def extract_parallel(
     output_dir = f"{CACHE_DIR}/extracted/{scale}"
     os.makedirs(output_dir, exist_ok=True)
 
+    # Resume: skip clips already extracted in a previous run
+    checkpoint_path = f"{output_dir}/samples_checkpoint.parquet"
+    already_extracted_clips = set()
+    prev_samples = []
+    if os.path.exists(checkpoint_path):
+        prev_df = pd.read_parquet(checkpoint_path)
+        prev_samples = prev_df.to_dict("records")
+        already_extracted_clips = set(prev_df["clip_id"].unique())
+        print(f"Resuming: {len(prev_samples)} samples from {len(already_extracted_clips)} clips already extracted")
+
+    selected_clips = [c for c in selected_clips if c not in already_extracted_clips]
+    print(f"Remaining after resume: {len(selected_clips)} clips")
+
     batches = [
         selected_clips[i : i + batch_size]
         for i in range(0, len(selected_clips), batch_size)
     ]
     n_batches = len(batches)
+    # Purge ALL zip files from the shared HF cache.
+    # Workers use local HF caches now, so they don't need shared zips.
+    # Previous runs left corrupted zips (429 error pages) that bloat copytree.
+    import glob
+    purged = 0
+    for zf in glob.glob(f"{CACHE_DIR}/hf/hub/**/*.zip", recursive=True):
+        os.remove(zf)
+        purged += 1
+    if purged:
+        print(f"Purged {purged} zip files from shared cache (workers use local caches)")
+
+    # Orchestrator already initialized avdi, which cached metadata to HF_HOME.
+    # Commit so workers can read from the shared cache (minus corrupted files).
+    cache_volume.commit()
+    print("Committed metadata cache for workers")
+
     print(f"Launching {n_batches} parallel workers ({batch_size} clips each)...")
     t_start = time.time()
 
-    results = list(
-        _extract_clip_batch.map(
-            batches,
-            [eval_clips] * n_batches,
-            [scale] * n_batches,
-            list(range(n_batches)),
-        )
-    )
-
-    all_samples = []
+    all_samples = list(prev_samples)
     all_errors = []
-    for r in results:
+    completed = 0
+
+    for r in _extract_clip_batch.map(
+        batches,
+        [eval_clips] * n_batches,
+        [scale] * n_batches,
+        list(range(n_batches)),
+    ):
         all_samples.extend(r["samples"])
         all_errors.extend(r["errors"])
+        completed += 1
+
+        # Checkpoint every 5 batches (more frequent for resilience)
+        if completed % 5 == 0:
+            ckpt = pd.DataFrame(all_samples)
+            ckpt.to_parquet(f"{output_dir}/samples_checkpoint.parquet", index=False)
+            cache_volume.commit()
+            print(f"  Checkpoint: {completed}/{n_batches} batches, {len(all_samples)} samples (total)")
 
     df = pd.DataFrame(all_samples)
     df.to_parquet(f"{output_dir}/samples.parquet", index=False)
 
     if all_errors:
         pd.DataFrame(all_errors).to_parquet(f"{output_dir}/errors.parquet", index=False)
+
+    # Clean up checkpoint file
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
 
     elapsed = time.time() - t_start
     print(f"\n=== Results ===")
@@ -401,249 +570,89 @@ def extract_parallel(
     secrets=[modal.Secret.from_name("huggingface")],
 )
 def extract_driving_data(scale: str = "tiny", seed: int = 42, eval_frac: float = 0.1):
-    import json
+    """Sequential extraction — use extract_parallel for large scale."""
     import os
     import time
 
     import numpy as np
     import pandas as pd
     import physical_ai_av
-    import torch
-    from PIL import Image
     from tqdm import tqdm
-
-    from alpamayo_r1.action_space.unicycle_accel_curvature import (
-        UnicycleAccelCurvatureActionSpace,
-    )
-    from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
-
-    import sys
-    sys.path.insert(0, "/opt/alpamayo/..")
-    # nav_prompt is in our repo, but we inline it here for Modal isolation
-    def trajectory_to_nav_prompt(ego_future_xyz):
-        forward = ego_future_xyz[-1, 0]
-        lateral = ego_future_xyz[-1, 1]
-        if forward < 2.0:
-            return "stop"
-        if abs(lateral) < 1.0:
-            return "drive forward"
-        if lateral > 3.0:
-            return "turn left"
-        if lateral < -3.0:
-            return "turn right"
-        if lateral > 0:
-            return "bear left"
-        return "bear right"
 
     max_clips = SCALES[scale]
     print(f"=== Extracting {scale} scale: {max_clips} clips ===")
 
-    # Initialize dataset interface
     avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
-    print(f"Dataset initialized, {len(avdi.clip_index)} total clips")
+    print(f"Dataset: {len(avdi.clip_index)} total clips")
 
-    # --- Filter clips ---
-    clip_index = avdi.clip_index.copy()
+    available_clips = _filter_clips(avdi)
+    print(f"Available after filtering: {len(available_clips)} clips")
 
-    # Try loading data_collection metadata for country/time filtering
-    try:
-        metadata_dir = os.path.dirname(avdi._clip_index_path)
-        dc_path = os.path.join(metadata_dir, "data_collection.parquet")
-        fp_path = os.path.join(metadata_dir, "metadata", "feature_presence.parquet")
-
-        if os.path.exists(dc_path):
-            metadata = pd.read_parquet(dc_path)
-            filtered = metadata[
-                (metadata["country"].isin(RIGHT_HAND_TRAFFIC))
-                & (metadata["time_of_day"] == "daytime")
-            ]
-            valid_clips = set(filtered["clip_id"].tolist())
-            print(f"  Country+daylight filter: {len(valid_clips)} clips")
-        else:
-            valid_clips = set(clip_index.index.tolist())
-            print("  No data_collection.parquet, skipping country/daylight filter")
-
-        if os.path.exists(fp_path):
-            features = pd.read_parquet(fp_path)
-            has_sensors = features[
-                (features.get("has_egomotion", True) == True)
-                & (features.get("has_camera_front_wide", True) == True)
-            ]
-            valid_clips &= set(has_sensors["clip_id"].tolist())
-            print(f"  Sensor filter: {len(valid_clips)} clips")
-    except Exception as e:
-        print(f"  Warning: metadata filtering failed ({e}), using all clips")
-        valid_clips = set(clip_index.index.tolist())
-
-    available_clips = [c for c in clip_index.index if c in valid_clips]
-    print(f"  Available after filtering: {len(available_clips)} clips")
-
-    # Sample clips
     rng = np.random.default_rng(seed)
     if len(available_clips) > max_clips:
         selected_clips = rng.choice(available_clips, size=max_clips, replace=False).tolist()
     else:
         selected_clips = available_clips[:max_clips]
 
-    # Split into train/eval
     n_eval = max(1, int(len(selected_clips) * eval_frac))
     rng.shuffle(selected_clips)
     eval_clips = set(selected_clips[:n_eval])
-    train_clips = set(selected_clips[n_eval:])
-    print(f"  Selected {len(selected_clips)} clips: {len(train_clips)} train, {len(eval_clips)} eval")
+    print(f"Selected {len(selected_clips)} clips: {len(selected_clips) - n_eval} train, {n_eval} eval")
 
-    # Initialize action space converter
-    action_space = UnicycleAccelCurvatureActionSpace()
-
-    # Extract samples
     output_dir = f"{CACHE_DIR}/extracted/{scale}"
     os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(f"{output_dir}/images", exist_ok=True)
 
-    # Resume from checkpoint if available
+    # Resume from checkpoint
     checkpoint_path = f"{output_dir}/samples_checkpoint.parquet"
     processed_ids = set()
-    samples = []
+    prev_samples = []
     if os.path.exists(checkpoint_path):
         existing = pd.read_parquet(checkpoint_path)
-        samples = existing.to_dict("records")
+        prev_samples = existing.to_dict("records")
         processed_ids = set(existing["sample_id"].tolist())
-        print(f"  Resuming from checkpoint: {len(samples)} samples already extracted")
+        print(f"Resuming from checkpoint: {len(prev_samples)} samples already extracted")
 
-    errors = []
+    remaining_clips = [c for c in selected_clips if not {f"{c}_{t0}" for t0 in T0_OFFSETS_US}.issubset(processed_ids)]
+    print(f"Remaining: {len(remaining_clips)} clips")
+
     t_start = time.time()
     checkpoint_interval = 50
+    all_samples = list(prev_samples)
+    all_errors = []
 
-    for clip_idx, clip_id in enumerate(tqdm(selected_clips, desc="Extracting")):
-        # Skip clips where all t0 offsets are already processed
-        clip_sample_ids = {f"{clip_id}_{t0}" for t0 in T0_OFFSETS_US}
-        if clip_sample_ids.issubset(processed_ids):
-            continue
+    for batch_start in range(0, len(remaining_clips), checkpoint_interval):
+        batch = remaining_clips[batch_start : batch_start + checkpoint_interval]
+        samples, errors = _process_clips(batch, eval_clips, scale, avdi=avdi)
+        all_samples.extend(samples)
+        all_errors.extend(errors)
 
-        for t0_us in T0_OFFSETS_US:
-            sample_id = f"{clip_id}_{t0_us}"
-            if sample_id in processed_ids:
-                continue
-            try:
-                # Load egomotion + front camera only
-                data = load_physical_aiavdataset(
-                    clip_id,
-                    t0_us=t0_us,
-                    avdi=avdi,
-                    maybe_stream=True,
-                    camera_features=[avdi.features.CAMERA.CAMERA_FRONT_WIDE_120FOV],
-                    num_frames=1,  # single frame at t0
-                )
+        ckpt_df = pd.DataFrame(all_samples)
+        ckpt_df.to_parquet(checkpoint_path, index=False)
+        cache_volume.commit()
 
-                # Speed filter: skip near-stationary
-                ego_hist = data["ego_history_xyz"][0, 0].numpy()  # (16, 3)
-                dt = 0.1
-                velocities = np.linalg.norm(np.diff(ego_hist, axis=0), axis=1) / dt
-                speed_at_t0 = velocities[-1]
-                if speed_at_t0 < 1.0:
-                    continue
+        done = batch_start + len(batch)
+        elapsed = time.time() - t_start
+        rate = done / elapsed if elapsed > 0 else 0
+        print(f"Checkpoint: {done}/{len(remaining_clips)} clips, "
+              f"{len(all_samples)} samples, {len(all_errors)} errors, "
+              f"{rate:.1f} clips/s")
 
-                # Trajectory length filter
-                ego_fut = data["ego_future_xyz"][0, 0].numpy()  # (64, 3)
-                traj_length = np.sum(np.linalg.norm(np.diff(ego_fut, axis=0), axis=1))
-                if traj_length < 10.0:
-                    continue
-
-                # Convert trajectory → (accel, curvature)
-                actions = action_space.traj_to_action(
-                    traj_history_xyz=data["ego_history_xyz"],
-                    traj_history_rot=data["ego_history_rot"],
-                    traj_future_xyz=data["ego_future_xyz"],
-                    traj_future_rot=data["ego_future_rot"],
-                )  # (1, 1, 64, 2)
-                actions_np = actions[0, 0].numpy()  # (64, 2)
-
-                # Trajectory geometry for VLM labeling context
-                lateral_disp = float(ego_fut[-1, 1])  # positive = left
-                forward_disp = float(ego_fut[-1, 0])
-                from alpamayo_r1.geometry.rotation import so3_to_yaw_torch
-                fut_yaws = so3_to_yaw_torch(data["ego_future_rot"][0, 0]).numpy()
-                heading_change_deg = float(np.degrees(fut_yaws[-1] - fut_yaws[0]))
-
-                # Placeholder nav prompt (will be replaced by VLM in label_nav_prompts)
-                nav_prompt = trajectory_to_nav_prompt(ego_fut)
-
-                # Compute state: [speed, heading_rate]
-                heading_rate = velocities[-1] - velocities[-2] if len(velocities) > 1 else 0.0
-                # Better heading rate: use rotation
-                ego_hist_rot = data["ego_history_rot"][0, 0].numpy()  # (16, 3, 3)
-                from alpamayo_r1.geometry.rotation import so3_to_yaw_torch
-                yaws = so3_to_yaw_torch(data["ego_history_rot"][0, 0]).numpy()
-                heading_rate = (yaws[-1] - yaws[-2]) / dt if len(yaws) > 1 else 0.0
-                state = np.array([speed_at_t0, heading_rate], dtype=np.float32)
-
-                # Save front camera image
-                # image_frames: (1, 1, 3, H, W) → (H, W, 3) uint8
-                img_tensor = data["image_frames"][0, 0]  # (3, H, W)
-                img_np = img_tensor.permute(1, 2, 0).numpy().astype(np.uint8)
-                # Downsample to 480×640
-                img_pil = Image.fromarray(img_np)
-                img_pil = img_pil.resize((640, 480), Image.LANCZOS)
-                img_path = f"{output_dir}/images/{sample_id}.jpg"
-                img_pil.save(img_path, quality=90)
-
-                samples.append({
-                    "sample_id": sample_id,
-                    "clip_id": clip_id,
-                    "t0_us": t0_us,
-                    "split": "eval" if clip_id in eval_clips else "train",
-                    "nav_prompt": nav_prompt,
-                    "speed": float(state[0]),
-                    "heading_rate": float(state[1]),
-                    "lateral_disp": lateral_disp,
-                    "forward_disp": forward_disp,
-                    "heading_change_deg": heading_change_deg,
-                    "actions": actions_np.tolist(),
-                    "image_path": f"images/{sample_id}.jpg",
-                })
-
-            except Exception as e:
-                errors.append({"clip_id": clip_id, "t0_us": t0_us, "error": str(e)})
-                if len(errors) <= 5:
-                    print(f"  Error on {clip_id} t0={t0_us}: {e}")
-
-        # Checkpoint every N clips
-        if (clip_idx + 1) % checkpoint_interval == 0:
-            ckpt_df = pd.DataFrame(samples)
-            ckpt_df.to_parquet(checkpoint_path, index=False)
-            cache_volume.commit()
-            elapsed = time.time() - t_start
-            rate = (clip_idx + 1) / elapsed
-            print(f"  Checkpoint: {clip_idx+1}/{len(selected_clips)} clips, "
-                  f"{len(samples)} samples, {len(errors)} errors, "
-                  f"{rate:.1f} clips/s")
-
-    # Save final metadata
-    df = pd.DataFrame(samples)
+    df = pd.DataFrame(all_samples)
     df.to_parquet(f"{output_dir}/samples.parquet", index=False)
-
-    # Remove checkpoint file now that we have the final version
     if os.path.exists(checkpoint_path):
         os.remove(checkpoint_path)
+    if all_errors:
+        pd.DataFrame(all_errors).to_parquet(f"{output_dir}/errors.parquet", index=False)
 
-    # Save error log
-    if errors:
-        pd.DataFrame(errors).to_parquet(f"{output_dir}/errors.parquet", index=False)
-
-    # Nav prompt distribution
     if len(df) > 0:
         print(f"\n=== Results ===")
         print(f"Total samples: {len(df)}")
         print(f"Train: {(df['split'] == 'train').sum()}, Eval: {(df['split'] == 'eval').sum()}")
-        print(f"Errors: {len(errors)}")
+        print(f"Errors: {len(all_errors)}")
         print(f"\nNav prompt distribution:")
         print(df["nav_prompt"].value_counts().to_string())
-        print(f"\nSpeed stats: mean={df['speed'].mean():.2f}, "
-              f"std={df['speed'].std():.2f}, "
-              f"min={df['speed'].min():.2f}, max={df['speed'].max():.2f}")
 
     cache_volume.commit()
-    print(f"\nSaved to {output_dir}")
     print(f"Total time: {time.time() - t_start:.1f}s")
     return len(df)
 

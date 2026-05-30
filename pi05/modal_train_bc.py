@@ -132,7 +132,7 @@ def train_bc(
     _patch_openpi()
 
     # Restore cached norm stats if available
-    cache_assets = f"{CACHE_DIR}/norm_stats/pi05_driving/markmusic/pi05-physical-av-bc"
+    cache_assets = f"{CACHE_DIR}/norm_stats_v2/pi05_driving/markmusic/pi05-physical-av-bc"
     assets_dir = f"{OPENPI_DIR}/assets/pi05_driving/markmusic/pi05-physical-av-bc"
     if os.path.exists(cache_assets) and not os.path.exists(assets_dir):
         os.makedirs(os.path.dirname(assets_dir), exist_ok=True)
@@ -149,7 +149,6 @@ def train_bc(
         stats_result = subprocess.run(stats_cmd, cwd=OPENPI_DIR, text=True)
         if stats_result.returncode != 0:
             raise RuntimeError("Failed to compute norm stats")
-        # Cache for next run
         os.makedirs(os.path.dirname(cache_assets), exist_ok=True)
         if os.path.exists(cache_assets):
             shutil.rmtree(cache_assets)
@@ -412,7 +411,10 @@ class DrivingInputs(transforms.DataTransformFn):
 @dataclasses.dataclass(frozen=True)
 class DrivingOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
-        return {"actions": np.asarray(data["actions"][:, :2])}
+        actions = np.asarray(data["actions"], dtype=np.float32)
+        if actions.ndim == 1:
+            actions = actions[np.newaxis, :]  # (128,) -> (1, 128)
+        return {"actions": actions}
 ''')
 
     # 2. Patch gemma.py to add gemma_2b_lora_driving variant
@@ -506,27 +508,29 @@ class LeRobotDrivingDataConfig(DataConfigFactory):
         name="pi05_driving",
         model=pi0_config.Pi0Config(
             pi05=True,
-            action_dim=2,
-            action_horizon=64,
+            action_dim=128,
+            action_horizon=1,
             paligemma_variant="gemma_2b_lora_driving",
             action_expert_variant="gemma_300m",
         ),
         data=LeRobotDrivingDataConfig(
             repo_id="markmusic/pi05-physical-av-bc",
-            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params"
         ),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
+            action_dim=128,
+            action_horizon=1,
             paligemma_variant="gemma_2b_lora_driving",
             action_expert_variant="gemma_300m",
         ).get_freeze_filter(),
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=390,
+            warmup_steps=250,
             peak_lr=3e-5,
-            decay_steps=7_800,
+            decay_steps=5_000,
             decay_lr=3e-6,
         ),
         optimizer=_optimizer.AdamW(
@@ -534,7 +538,7 @@ class LeRobotDrivingDataConfig(DataConfigFactory):
             b2=0.999,
             clip_gradient_norm=1.0,
         ),
-        num_train_steps=7_800,
+        num_train_steps=5_000,
         batch_size=96,
         fsdp_devices=1,
         save_interval=250,
