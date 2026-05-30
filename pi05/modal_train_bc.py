@@ -4,8 +4,19 @@ Trains π0.5 on PhysicalAI-AV ground truth driving data using the
 pi05_driving config in openpi. LoRA on VLM + full fine-tune on action expert.
 
 Usage:
-    modal run pi05/modal_train_bc.py::train_bc
-    modal run pi05/modal_train_bc.py::train_bc --num-steps 100  # smoke test
+    # Pre-flight: validate HF push works
+    modal run pi05/modal_train_bc.py::validate_hf
+
+    # Train (detached so laptop can close)
+    modal run --detach pi05/modal_train_bc.py::train_bc --num-steps 5000
+
+    # During training — on-demand checkpoint save:
+    modal run pi05/modal_train_bc.py::trigger_save
+
+    # During training — save checkpoint + push to HuggingFace:
+    modal run pi05/modal_train_bc.py::trigger_push_hf
+
+    # After training — upload a specific checkpoint:
     modal run pi05/modal_train_bc.py::upload_checkpoint --step 5000
 """
 
@@ -49,6 +60,99 @@ cache_volume = modal.Volume.from_name("pi05-cache", create_if_missing=True)
 VOLUMES = {CACHE_DIR: cache_volume}
 
 app = modal.App(APP_NAME)
+
+TRIGGER_DIR = f"{CACHE_DIR}/triggers"
+HF_CHECKPOINT_REPO = "markmusic/pi05-physical-av-bc-checkpoint"
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight: validate HF push works before spending GPU money
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=train_image,
+    timeout=300,
+    volumes=VOLUMES,
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def validate_hf():
+    """Test HF token + repo access. Run this before training."""
+    import os
+    import tempfile
+
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    user = api.whoami()
+    print(f"HF token valid: logged in as {user['name']}")
+
+    api.create_repo(
+        HF_CHECKPOINT_REPO, repo_type="model", private=True, exist_ok=True
+    )
+    print(f"Repo {HF_CHECKPOINT_REPO} exists and is writable")
+
+    test_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, dir="/tmp"
+    )
+    test_file.write("preflight check")
+    test_file.close()
+    api.upload_file(
+        path_or_fileobj=test_file.name,
+        path_in_repo=".preflight_test",
+        repo_id=HF_CHECKPOINT_REPO,
+        repo_type="model",
+        commit_message="preflight validation",
+    )
+    os.unlink(test_file.name)
+    api.delete_file(
+        ".preflight_test",
+        repo_id=HF_CHECKPOINT_REPO,
+        repo_type="model",
+        commit_message="remove preflight test",
+    )
+    print("HF push validated — write + delete succeeded")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Trigger functions: on-demand checkpoint save / HF push
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=train_image,
+    timeout=60,
+    volumes=VOLUMES,
+)
+def trigger_save():
+    """Write a trigger file that tells the training loop to save a checkpoint NOW."""
+    import os
+    import pathlib
+
+    pathlib.Path(TRIGGER_DIR).mkdir(parents=True, exist_ok=True)
+    pathlib.Path(f"{TRIGGER_DIR}/save_now").touch()
+    cache_volume.commit()
+    print("Trigger written: training will save a checkpoint at the next step check")
+    return "save_now trigger queued"
+
+
+@app.function(
+    image=train_image,
+    timeout=60,
+    volumes=VOLUMES,
+)
+def trigger_push_hf():
+    """Write a trigger that saves a checkpoint AND pushes it to HuggingFace."""
+    import os
+    import pathlib
+
+    pathlib.Path(TRIGGER_DIR).mkdir(parents=True, exist_ok=True)
+    pathlib.Path(f"{TRIGGER_DIR}/save_now").touch()
+    pathlib.Path(f"{TRIGGER_DIR}/push_hf").touch()
+    cache_volume.commit()
+    print("Trigger written: training will save + push checkpoint to HF")
+    return "push_hf trigger queued"
 
 
 # ---------------------------------------------------------------------------
@@ -121,12 +225,27 @@ def train_bc(
     exp_name: str = "bc-coldstart",
     resume: bool = False,
     batch_size: int = 96,
+    skip_hf_validation: bool = False,
 ):
     import os
     import pathlib
     import shutil
     import subprocess
     import sys
+    import threading
+    import time
+
+    # --- Pre-flight: validate HF push works ---
+    if not skip_hf_validation:
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+        user = api.whoami()
+        print(f"Pre-flight: HF token valid (user={user['name']})")
+        api.create_repo(
+            HF_CHECKPOINT_REPO, repo_type="model", private=True, exist_ok=True
+        )
+        print(f"Pre-flight: HF repo {HF_CHECKPOINT_REPO} accessible")
 
     # Patch openpi with our driving config
     _patch_openpi()
@@ -187,6 +306,59 @@ def train_bc(
     print(f"GPUs: {os.environ.get('CUDA_VISIBLE_DEVICES', 'all')}")
     print(f"Checkpoint dir: {checkpoint_dir}")
 
+    # --- Background thread: watches for push_hf trigger and uploads ---
+    _stop_watcher = threading.Event()
+
+    def _hf_upload_watcher():
+        from huggingface_hub import HfApi
+
+        hf_api = HfApi()
+        ckpt_base = f"{checkpoint_dir}/pi05_driving/{exp_name}"
+        while not _stop_watcher.is_set():
+            _stop_watcher.wait(30)
+            if _stop_watcher.is_set():
+                break
+            try:
+                cache_volume.reload()
+                trigger = pathlib.Path(f"{TRIGGER_DIR}/push_hf")
+                if trigger.exists():
+                    trigger.unlink(missing_ok=True)
+                    cache_volume.commit()
+                    if not os.path.exists(ckpt_base):
+                        print("[hf-watcher] No checkpoints yet, skipping upload")
+                        continue
+                    steps = sorted(
+                        [int(d) for d in os.listdir(ckpt_base) if d.isdigit()],
+                        reverse=True,
+                    )
+                    if not steps:
+                        print("[hf-watcher] No checkpoint steps found")
+                        continue
+                    latest = steps[0]
+                    params_dir = os.path.join(ckpt_base, str(latest), "params")
+                    if not os.path.exists(params_dir):
+                        params_dir = os.path.join(ckpt_base, str(latest))
+                    print(f"[hf-watcher] Uploading step {latest} to {HF_CHECKPOINT_REPO}")
+                    hf_api.create_repo(
+                        HF_CHECKPOINT_REPO,
+                        repo_type="model",
+                        private=True,
+                        exist_ok=True,
+                    )
+                    hf_api.upload_folder(
+                        folder_path=params_dir,
+                        repo_id=HF_CHECKPOINT_REPO,
+                        repo_type="model",
+                        commit_message=f"Checkpoint at step {latest}",
+                    )
+                    print(f"[hf-watcher] Uploaded step {latest} to HF")
+            except Exception as e:
+                print(f"[hf-watcher] Error: {e}")
+
+    watcher_thread = threading.Thread(target=_hf_upload_watcher, daemon=True)
+    watcher_thread.start()
+    print("Background HF upload watcher started (polls every 30s)")
+
     result = subprocess.run(
         cmd,
         cwd=OPENPI_DIR,
@@ -194,11 +366,41 @@ def train_bc(
         text=True,
     )
 
+    _stop_watcher.set()
     cache_volume.commit()
 
     if result.returncode != 0:
         print(f"Training failed with return code {result.returncode}")
         return result.returncode
+
+    # Auto-upload final checkpoint to HF
+    ckpt_base = f"{checkpoint_dir}/pi05_driving/{exp_name}"
+    if os.path.exists(ckpt_base):
+        from huggingface_hub import HfApi
+
+        hf_api = HfApi()
+        steps = sorted(
+            [int(d) for d in os.listdir(ckpt_base) if d.isdigit()], reverse=True
+        )
+        if steps:
+            latest = steps[0]
+            params_dir = os.path.join(ckpt_base, str(latest), "params")
+            if not os.path.exists(params_dir):
+                params_dir = os.path.join(ckpt_base, str(latest))
+            print(f"Uploading final checkpoint (step {latest}) to {HF_CHECKPOINT_REPO}")
+            hf_api.create_repo(
+                HF_CHECKPOINT_REPO,
+                repo_type="model",
+                private=True,
+                exist_ok=True,
+            )
+            hf_api.upload_folder(
+                folder_path=params_dir,
+                repo_id=HF_CHECKPOINT_REPO,
+                repo_type="model",
+                commit_message=f"Final checkpoint at step {latest}",
+            )
+            print(f"Final checkpoint uploaded to {HF_CHECKPOINT_REPO}")
 
     print("Training complete!")
     return 0
@@ -674,5 +876,46 @@ def main(config: _config.TrainConfig):  # LR_EVAL_PATCHED''',
         with open(train_script, "w") as f:
             f.write(content)
         print("  Patched scripts/train.py for LR + eval loss logging")
+
+    # 7. Add trigger-file checkpoint save (on-demand save via /cache/triggers/save_now)
+    with open(train_script, "r") as f:
+        content = f.read()
+    if "TRIGGER_PATCHED" not in content:
+        content = content.replace(
+            "    infos = []",
+            '''    import pathlib as _pathlib  # TRIGGER_PATCHED
+    _trigger_dir = _pathlib.Path("/cache/triggers")
+
+    infos = []''',
+        )
+
+        content = content.replace(
+            "        batch = next(data_iter)",
+            '''        # Check for on-demand save trigger every 10 steps
+        if step % 10 == 0 and _trigger_dir.exists():
+            _save_trigger = _trigger_dir / "save_now"
+            if _save_trigger.exists():
+                try:
+                    _save_trigger.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                pbar.write(f"[trigger] Manual checkpoint save at step {step}")
+                if _eval_batches:
+                    _el = []
+                    for _eb in _eval_batches:
+                        with sharding.set_mesh(mesh):
+                            _el.append(peval_step(train_rng, train_state, _eb))
+                    _eval_loss = float(np.mean([float(jax.device_get(x)) for x in _el]))
+                    pbar.write(f"[trigger] eval_loss={_eval_loss:.4f}")
+                    wandb.log({"eval_loss": _eval_loss}, step=step)
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+                pbar.write(f"[trigger] Checkpoint saved at step {step}")
+
+        batch = next(data_iter)''',
+        )
+
+        with open(train_script, "w") as f:
+            f.write(content)
+        print("  Patched scripts/train.py for trigger-file checkpoint saves")
 
     print("openpi patched with driving config")
