@@ -156,7 +156,7 @@ Without AR1 inference bottleneck, we can afford **more data** at lower cost. Tar
 
 ### Data filtering
 
-Metadata available via `data_collection.parquet` (joined on `clip_id`) and `feature_presence.parquet`. Existing filtering pattern at `simlingo/scripts/extract_nvidia.py:79-94`.
+Metadata available via `data_collection.parquet` (joined on `clip_id`) and `feature_presence.parquet`. Existing filtering pattern at `other_models/simlingo/scripts/extract_nvidia.py:79-94`.
 
 ```python
 # Filter from data_collection.parquet + feature_presence.parquet
@@ -201,7 +201,7 @@ For each (clip_id, t0) pair:
 - Data loading: `alpamayo/src/alpamayo_r1/load_physical_aiavdataset.py`
 - Action conversion: `alpamayo/src/alpamayo_r1/action_space/unicycle_accel_curvature.py:227-299` (`traj_to_action`)
 - Clip enumeration: `physical_ai_av.PhysicalAIAVDatasetInterface` → `avdi.clip_index` DataFrame
-- SimLingo route derivation (reference): `simlingo/scripts/nvidia_loader.py:115` (`egomotion_to_route()`)
+- SimLingo route derivation (reference): `other_models/simlingo/scripts/nvidia_loader.py:115` (`egomotion_to_route()`)
 
 ### Implementation: `pi05/modal_extract_data.py`
 ```
