@@ -7,6 +7,12 @@ Usage:
     # Pre-flight: validate HF push works
     modal run pi05/modal_train_bc.py::validate_hf
 
+    # Fresh download dataset from HF (needed once, gets all parquets)
+    modal run --detach pi05/modal_train_bc.py::fresh_download
+
+    # Consolidate 10K parquets into 10 chunk files (needed once)
+    modal run --detach pi05/modal_train_bc.py::consolidate_dataset
+
     # Train (detached so laptop can close)
     modal run --detach pi05/modal_train_bc.py::train_bc --num-steps 5000
 
@@ -18,6 +24,31 @@ Usage:
 
     # After training — upload a specific checkpoint:
     modal run pi05/modal_train_bc.py::upload_checkpoint --step 5000
+
+    # Run diagnostic to test dataset loading:
+    modal run --detach pi05/modal_train_bc.py::diagnose_dataset
+
+Dataset issues solved (2026-05-30):
+    1. HF API rate limits (429): LeRobot's snapshot_download makes per-file API calls
+       to check ETags. With 10K files, hits 1000 req/5min rate limit. Fixed by patching
+       download_episodes to skip when local data exists on the volume.
+
+    2. No images/ directory: Images are embedded directly in parquet files (not stored
+       as separate PNGs). The LeRobotDataset __init__ assertion checks for separate
+       image files — patched to skip this check.
+
+    3. 10K individual parquets too slow: Each episode stored as 1 parquet file (~300KB).
+       Loading 10K files on Modal FUSE is very slow. Fixed by consolidating into 10
+       chunk-level files (~300MB each). Must commit volume after each chunk or progress
+       is lost on timeout.
+
+    4. HF-generated file-*.parquet conflicts: Git-cloning from HF includes auto-generated
+       file-000.parquet files that are incompatible with our episode format. Cleaned up
+       during consolidation.
+
+    5. Dataset not on volume: Original dataset was built on a different container and
+       only pushed to HF. Used git clone (bypasses per-file rate limits) to download
+       fresh copy to the volume.
 """
 
 from __future__ import annotations
@@ -156,6 +187,352 @@ def trigger_push_hf():
 
 
 # ---------------------------------------------------------------------------
+# Consolidate dataset: merge 10K tiny parquets → 10 larger ones
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=train_image,
+    timeout=60 * 60,
+    volumes=VOLUMES,
+    memory=32 * 1024,
+)
+def consolidate_dataset(repo_id: str = "markmusic/pi05-physical-av-bc"):
+    """Merge per-episode parquet files into chunk-level files for fast loading.
+
+    Commits after each chunk so progress survives timeouts.
+    """
+    import glob
+    import os
+    import shutil
+    import tempfile
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    dataset_dir = f"{CACHE_DIR}/hf/lerobot/{repo_id}"
+    data_dir = os.path.join(dataset_dir, "data")
+    marker = os.path.join(dataset_dir, ".consolidated")
+
+    if os.path.exists(marker):
+        print("Dataset already consolidated")
+        return
+
+    if not os.path.exists(data_dir):
+        raise FileNotFoundError(f"No data directory at {data_dir}")
+
+    chunk_dirs = sorted(glob.glob(os.path.join(data_dir, "chunk-*")))
+    print(f"Consolidating {len(chunk_dirs)} chunks...")
+
+    for chunk_dir in chunk_dirs:
+        episode_files = sorted(glob.glob(os.path.join(chunk_dir, "episode_*.parquet")))
+        if len(episode_files) <= 1:
+            print(f"  {os.path.basename(chunk_dir)}: already consolidated")
+            continue
+
+        print(f"  {os.path.basename(chunk_dir)}: merging {len(episode_files)} files...", end=" ", flush=True)
+
+        # Read and merge on local /tmp (fast), then copy back to volume
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tables = []
+            for f in episode_files:
+                try:
+                    tables.append(pq.read_table(f))
+                except Exception as e:
+                    print(f"\n    WARNING: skipping corrupt file {os.path.basename(f)}: {e}")
+
+            merged = pa.concat_tables(tables)
+            tmp_out = os.path.join(tmpdir, "episode_000000.parquet")
+            pq.write_table(merged, tmp_out)
+
+            # Delete originals, copy merged file
+            for f in episode_files:
+                os.remove(f)
+            shutil.copy2(tmp_out, os.path.join(chunk_dir, "episode_000000.parquet"))
+
+        print(f"{len(merged)} rows", flush=True)
+        cache_volume.commit()
+
+    # Remove HuggingFace auto-generated file-*.parquet files that conflict
+    for chunk_dir in chunk_dirs:
+        for extra in glob.glob(os.path.join(chunk_dir, "file-*.parquet")):
+            print(f"  Removing HF-generated {os.path.basename(chunk_dir)}/{os.path.basename(extra)}")
+            os.remove(extra)
+
+    with open(marker, "w") as f:
+        f.write("done")
+    cache_volume.commit()
+    print("Consolidation complete")
+
+
+# ---------------------------------------------------------------------------
+# Fresh download: git clone dataset from HF to get all files incl. images
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=train_image,
+    timeout=60 * 60 * 2,
+    volumes=VOLUMES,
+    secrets=[modal.Secret.from_name("huggingface")],
+    memory=32 * 1024,
+)
+def fresh_download(repo_id: str = "markmusic/pi05-physical-av-bc"):
+    """Git-clone dataset from HuggingFace to get all files including images.
+
+    Uses git-lfs batch API which avoids per-file rate limits.
+    Downloads to /cache/hf/lerobot/<repo_id>-fresh, then replaces the original.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    fresh_dir = f"{CACHE_DIR}/hf/lerobot/{repo_id}-fresh"
+    final_dir = f"{CACHE_DIR}/hf/lerobot/{repo_id}"
+
+    # Get HF token for private repo
+    hf_token = os.environ.get("HF_TOKEN", os.environ.get("HUGGING_FACE_HUB_TOKEN", ""))
+    if not hf_token:
+        raise RuntimeError("No HF token found — set HUGGING_FACE_HUB_TOKEN secret")
+
+    clone_url = f"https://user:{hf_token}@huggingface.co/datasets/{repo_id}"
+
+    # Remove stale fresh dir from any previous attempt
+    if os.path.exists(fresh_dir):
+        print(f"Removing previous fresh download at {fresh_dir}")
+        shutil.rmtree(fresh_dir)
+
+    print(f"Git-cloning {repo_id} to {fresh_dir}...")
+    print("This downloads all files including 10K images via git-lfs batch API")
+    result = subprocess.run(
+        ["git", "lfs", "install"],
+        cwd="/tmp",
+        capture_output=True,
+        text=True,
+    )
+    print(f"git lfs install: {result.stdout.strip()}")
+
+    result = subprocess.run(
+        ["git", "clone", "--depth=1", clone_url, fresh_dir],
+        text=True,
+        timeout=60 * 90,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Git clone failed (rc={result.returncode})")
+
+    # Verify we got what we need
+    for subdir in ["data", "meta"]:
+        path = os.path.join(fresh_dir, subdir)
+        if os.path.exists(path):
+            n_files = sum(1 for _ in os.scandir(path))
+            print(f"  {subdir}/: {n_files} entries")
+        else:
+            print(f"  WARNING: no {subdir}/ directory!")
+
+    images_dir = os.path.join(fresh_dir, "images")
+    if os.path.exists(images_dir):
+        n_imgs = 0
+        for root, dirs, files in os.walk(images_dir):
+            n_imgs += len(files)
+        print(f"  images/: {n_imgs} files")
+    else:
+        print("  WARNING: no images/ directory!")
+
+    # Check data chunk structure
+    data_dir = os.path.join(fresh_dir, "data")
+    if os.path.exists(data_dir):
+        for chunk in sorted(os.listdir(data_dir)):
+            chunk_path = os.path.join(data_dir, chunk)
+            if os.path.isdir(chunk_path):
+                files = os.listdir(chunk_path)
+                print(f"  data/{chunk}: {len(files)} files")
+
+    # Rename old dir (preserve it, don't delete per user instructions)
+    backup_dir = f"{final_dir}-old"
+    if os.path.exists(final_dir):
+        if os.path.exists(backup_dir):
+            print(f"Removing previous backup at {backup_dir}")
+            shutil.rmtree(backup_dir)
+        print(f"Moving old dataset to {backup_dir}")
+        os.rename(final_dir, backup_dir)
+
+    # Move fresh download into place
+    os.rename(fresh_dir, final_dir)
+    print(f"Fresh dataset installed at {final_dir}")
+
+    # Remove git metadata to save space (not needed for training)
+    git_dir = os.path.join(final_dir, ".git")
+    if os.path.exists(git_dir):
+        shutil.rmtree(git_dir)
+        print("Removed .git directory")
+
+    cache_volume.commit()
+    print("Done! Dataset ready with all images.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic: quickly test dataset loading to find hangs
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=train_image,
+    gpu="H100",
+    timeout=60 * 30,
+    volumes=VOLUMES,
+    secrets=[modal.Secret.from_name("huggingface")],
+    memory=32 * 1024,
+)
+def diagnose_dataset(repo_id: str = "markmusic/pi05-physical-av-bc"):
+    """Test dataset loading step-by-step to find where it hangs."""
+    import subprocess
+    import time
+
+    _patch_openpi()
+    _consolidate_local_dataset(repo_id)
+    _link_dataset_to_hf_cache(repo_id)
+
+    script = f'''
+import time, sys, os, glob
+sys.stdout.reconfigure(line_buffering=True)
+
+print("[1/8] Importing modules...")
+t0 = time.time()
+import openpi.training.config as _config
+import openpi.training.data_loader as _data_loader
+import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+print(f"  Imports done in {{time.time()-t0:.1f}}s")
+
+print("[2/8] Checking local dataset on volume...")
+local_path = "/cache/hf/lerobot/markmusic/pi05-physical-av-bc"
+if os.path.exists(local_path):
+    dirs = os.listdir(local_path)
+    print(f"  Local dataset found at {{local_path}}")
+    print(f"  Contents: {{dirs[:20]}}")
+    meta_path = os.path.join(local_path, "meta")
+    if os.path.exists(meta_path):
+        meta_files = os.listdir(meta_path)
+        print(f"  meta/: {{meta_files}}")
+        info_path = os.path.join(meta_path, "info.json")
+        if os.path.exists(info_path):
+            import json
+            with open(info_path) as f:
+                info = json.load(f)
+            print(f"  info.json: version={{info.get('codebase_version')}}, total_episodes={{info.get('total_episodes')}}")
+    data_path = os.path.join(local_path, "data")
+    if os.path.exists(data_path):
+        chunks = os.listdir(data_path)
+        print(f"  data/: {{chunks[:10]}}")
+        for chunk in chunks[:2]:
+            chunk_path = os.path.join(data_path, chunk)
+            if os.path.isdir(chunk_path):
+                files = os.listdir(chunk_path)
+                print(f"    {{chunk}}/: {{len(files)}} files, first={{files[:3]}}")
+    img_path = os.path.join(local_path, "images")
+    if os.path.exists(img_path):
+        n_imgs = sum(1 for _ in glob.iglob(os.path.join(img_path, "**/*.png"), recursive=True))
+        print(f"  images/: {{n_imgs}} PNG files")
+else:
+    print(f"  No local dataset at {{local_path}}")
+
+print("[3/8] Checking HF hub cache symlink...")
+hub_dir = "/cache/hf/hub/datasets--markmusic--pi05-physical-av-bc"
+snapshot_dir = os.path.join(hub_dir, "snapshots/local")
+refs_file = os.path.join(hub_dir, "refs/main")
+if os.path.exists(snapshot_dir):
+    is_link = os.path.islink(snapshot_dir)
+    target = os.readlink(snapshot_dir) if is_link else "NOT A SYMLINK"
+    print(f"  Snapshot dir exists: symlink={{is_link}}, target={{target}}")
+    if os.path.exists(refs_file):
+        with open(refs_file) as f:
+            print(f"  refs/main: {{f.read().strip()}}")
+    contents = os.listdir(snapshot_dir) if os.path.isdir(snapshot_dir) else []
+    print(f"  Contents: {{contents[:15]}}")
+else:
+    print(f"  NO symlink at {{snapshot_dir}} — dataset will try to download from HF!")
+
+print("[4/8] Loading config...")
+t0 = time.time()
+config = _config.get_config("pi05_driving")
+data_config = config.data.create(config.assets_dirs, config.model)
+print(f"  Config loaded in {{time.time()-t0:.1f}}s")
+print(f"  repo_id: {{data_config.repo_id}}")
+print(f"  action_sequence_keys: {{data_config.action_sequence_keys}}")
+print(f"  action_horizon: {{config.model.action_horizon}}")
+
+print("[5/8] Loading dataset metadata (should use cached symlink)...")
+t0 = time.time()
+dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
+print(f"  Metadata loaded in {{time.time()-t0:.1f}}s")
+print(f"  fps: {{dataset_meta.fps}}")
+print(f"  tasks: {{dataset_meta.tasks}}")
+
+print("[6/8] Creating LeRobotDataset (should use cached symlink)...")
+delta_timestamps = {{
+    key: [t / dataset_meta.fps for t in range(config.model.action_horizon)]
+    for key in data_config.action_sequence_keys
+}}
+print(f"  delta_timestamps: {{delta_timestamps}}")
+t0 = time.time()
+dataset = lerobot_dataset.LeRobotDataset(
+    data_config.repo_id,
+    delta_timestamps=delta_timestamps,
+)
+print(f"  Dataset created in {{time.time()-t0:.1f}}s")
+print(f"  Length: {{len(dataset)}}")
+
+print("[7/8] Loading first sample...")
+t0 = time.time()
+sample = dataset[0]
+print(f"  Sample loaded in {{time.time()-t0:.1f}}s")
+for k, v in sample.items():
+    import numpy as np
+    arr = np.asarray(v) if not isinstance(v, str) else v
+    if isinstance(arr, np.ndarray):
+        print(f"    {{k}}: shape={{arr.shape}}, dtype={{arr.dtype}}")
+    else:
+        print(f"    {{k}}: {{repr(arr)[:80]}}")
+
+print("[8/8] Testing DataLoader iteration...")
+t0 = time.time()
+from openpi.transforms import PromptFromLeRobotTask
+dl = _data_loader.TorchDataLoader(
+    _data_loader.TransformedDataset(dataset, [PromptFromLeRobotTask(dataset_meta.tasks)]),
+    local_batch_size=4,
+    num_workers=0,
+    shuffle=False,
+    num_batches=2,
+)
+batch = next(iter(dl))
+print(f"  First batch loaded in {{time.time()-t0:.1f}}s")
+for k, v in batch.items():
+    import numpy as np
+    arr = np.asarray(v) if not isinstance(v, str) else v
+    if isinstance(arr, np.ndarray):
+        print(f"    {{k}}: shape={{arr.shape}}")
+    else:
+        print(f"    {{k}}: type={{type(arr).__name__}}")
+
+print("DIAGNOSTIC COMPLETE — dataset loads successfully")
+'''
+    import tempfile
+    script_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False, dir="/tmp"
+    )
+    script_file.write(script)
+    script_file.close()
+
+    result = subprocess.run(
+        [f"{OPENPI_DIR}/.venv/bin/python", "-u", script_file.name],
+        cwd=OPENPI_DIR,
+        text=True,
+        env={**__import__("os").environ, "PYTHONUNBUFFERED": "1"},
+    )
+    return result.returncode
+
+
+# ---------------------------------------------------------------------------
 # Compute normalization stats (must run before training)
 # ---------------------------------------------------------------------------
 
@@ -173,6 +550,8 @@ def compute_norm_stats():
     import subprocess
 
     _patch_openpi()
+    _consolidate_local_dataset()
+    _link_dataset_to_hf_cache()
 
     cmd = [
         f"{OPENPI_DIR}/.venv/bin/python", "-m", "scripts.compute_norm_stats",
@@ -222,10 +601,11 @@ def compute_norm_stats():
 )
 def train_bc(
     num_steps: int | None = None,
-    exp_name: str = "bc-coldstart",
+    exp_name: str = "bc-coldstart-v2",
     resume: bool = False,
     batch_size: int = 96,
     skip_hf_validation: bool = False,
+    scale: str = "xlarge",
 ):
     import os
     import pathlib
@@ -234,6 +614,9 @@ def train_bc(
     import sys
     import threading
     import time
+
+    TRAIN_REPO = "markmusic/pi05-physical-av-bc"
+    EVAL_REPO = "markmusic/pi05-physical-av-bc-eval"
 
     # --- Pre-flight: validate HF push works ---
     if not skip_hf_validation:
@@ -250,9 +633,23 @@ def train_bc(
     # Patch openpi with our driving config
     _patch_openpi()
 
+    # Build LeRobot datasets from extracted data (train + eval, no HF push)
+    extracted_path = f"{CACHE_DIR}/extracted/{scale}/samples.parquet"
+    if os.path.exists(extracted_path):
+        _build_lerobot_from_extracted(scale, train_repo=TRAIN_REPO, eval_repo=EVAL_REPO)
+    else:
+        print(f"No extracted data at {extracted_path}, using existing LeRobot dataset")
+
+    # Consolidate dataset parquets if needed (many files → few files)
+    _consolidate_local_dataset()
+
+    # Symlink local datasets into HF hub cache so lerobot skips downloads
+    _link_dataset_to_hf_cache(repo_id=TRAIN_REPO)
+    _link_dataset_to_hf_cache(repo_id=EVAL_REPO)
+
     # Restore cached norm stats if available
-    cache_assets = f"{CACHE_DIR}/norm_stats_v2/pi05_driving/markmusic/pi05-physical-av-bc"
-    assets_dir = f"{OPENPI_DIR}/assets/pi05_driving/markmusic/pi05-physical-av-bc"
+    cache_assets = f"{CACHE_DIR}/norm_stats_v2/pi05_driving/{TRAIN_REPO}"
+    assets_dir = f"{OPENPI_DIR}/assets/pi05_driving/{TRAIN_REPO}"
     if os.path.exists(cache_assets) and not os.path.exists(assets_dir):
         os.makedirs(os.path.dirname(assets_dir), exist_ok=True)
         shutil.copytree(cache_assets, assets_dir)
@@ -262,12 +659,16 @@ def train_bc(
     if not os.path.exists(assets_dir):
         print("Norm stats missing — computing now...")
         stats_cmd = [
-            f"{OPENPI_DIR}/.venv/bin/python", "-m", "scripts.compute_norm_stats",
+            f"{OPENPI_DIR}/.venv/bin/python", "-u", "-m", "scripts.compute_norm_stats",
             "--config-name=pi05_driving",
         ]
-        stats_result = subprocess.run(stats_cmd, cwd=OPENPI_DIR, text=True)
+        stats_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        print(f"Running: {' '.join(stats_cmd)}")
+        stats_result = subprocess.run(
+            stats_cmd, cwd=OPENPI_DIR, text=True, env=stats_env,
+        )
         if stats_result.returncode != 0:
-            raise RuntimeError("Failed to compute norm stats")
+            raise RuntimeError(f"Failed to compute norm stats (rc={stats_result.returncode})")
         os.makedirs(os.path.dirname(cache_assets), exist_ok=True)
         if os.path.exists(cache_assets):
             shutil.rmtree(cache_assets)
@@ -275,11 +676,18 @@ def train_bc(
         cache_volume.commit()
         print("Norm stats computed and cached")
 
+    # Symlink train norm stats for eval dataset (same normalization)
+    eval_assets = f"{OPENPI_DIR}/assets/pi05_driving/{EVAL_REPO}"
+    if os.path.exists(assets_dir) and not os.path.exists(eval_assets):
+        os.makedirs(os.path.dirname(eval_assets), exist_ok=True)
+        os.symlink(assets_dir, eval_assets)
+        print(f"Symlinked eval norm stats → train norm stats")
+
     checkpoint_dir = f"{CACHE_DIR}/checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     cmd = [
-        f"{OPENPI_DIR}/.venv/bin/python", "-m", "scripts.train",
+        f"{OPENPI_DIR}/.venv/bin/python", "-u", "-m", "scripts.train",
         "pi05_driving",
         "--exp-name", exp_name,
     ]
@@ -299,6 +707,7 @@ def train_bc(
         **os.environ,
         "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.9",
         "WANDB_PROJECT": "pi05-driving",
+        "PYTHONUNBUFFERED": "1",
     }
 
     print(f"=== Training π0.5 driving BC ===")
@@ -546,8 +955,250 @@ def _convert_dataset_v3_to_v21(repo_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Build LeRobot datasets from extracted data (no HF push)
+# ---------------------------------------------------------------------------
+
+
+def _build_lerobot_from_extracted(
+    scale: str,
+    train_repo: str = "markmusic/pi05-physical-av-bc",
+    eval_repo: str = "markmusic/pi05-physical-av-bc-eval",
+):
+    """Build train + eval LeRobot datasets from extracted parquet + images.
+
+    Runs inside openpi's venv (needs lerobot). No HF push — data stays on volume.
+    """
+    import os
+    import subprocess
+    import tempfile
+
+    output_dir = f"{CACHE_DIR}/extracted/{scale}"
+    samples_path = f"{output_dir}/samples.parquet"
+    train_path = f"{CACHE_DIR}/hf/lerobot/{train_repo}"
+    eval_path = f"{CACHE_DIR}/hf/lerobot/{eval_repo}"
+
+    if not os.path.exists(samples_path):
+        raise FileNotFoundError(f"No extracted data at {samples_path}. Run extraction first.")
+
+    if os.path.exists(f"{train_path}/.built") and os.path.exists(f"{eval_path}/.built"):
+        print(f"LeRobot datasets already built (train={train_path}, eval={eval_path})")
+        return
+
+    build_script = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, dir="/tmp")
+    build_script.write(f'''
+import json, os, shutil, time, sys
+sys.stdout.reconfigure(line_buffering=True)
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+from tqdm import tqdm
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+output_dir = "{output_dir}"
+cache_dir = "{CACHE_DIR}"
+splits = {{
+    "train": "{train_repo}",
+    "eval": "{eval_repo}",
+}}
+
+df = pd.read_parquet(f"{{output_dir}}/samples.parquet")
+print(f"Loaded {{len(df)}} total samples")
+print(f"Split distribution: {{df['split'].value_counts().to_dict()}}")
+
+for split_name, repo_id in splits.items():
+    local_path = f"{{cache_dir}}/hf/lerobot/{{repo_id}}"
+    marker = f"{{local_path}}/.built"
+
+    if os.path.exists(marker):
+        print(f"{{split_name}} already built at {{local_path}}")
+        continue
+
+    split_df = df[df["split"] == split_name].reset_index(drop=True)
+    print(f"\\nBuilding {{split_name}}: {{len(split_df)}} samples → {{repo_id}}")
+
+    if os.path.exists(local_path):
+        shutil.rmtree(local_path)
+
+    dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        robot_type="cart_fsd",
+        fps=10,
+        features={{
+            "observation.images.front": {{
+                "dtype": "image",
+                "shape": (480, 640, 3),
+                "names": ["height", "width", "channel"],
+            }},
+            "observation.state": {{
+                "dtype": "float32",
+                "shape": (2,),
+                "names": ["speed", "heading_rate"],
+            }},
+            "action": {{
+                "dtype": "float32",
+                "shape": (128,),
+                "names": None,
+            }},
+        }},
+        image_writer_threads=20,
+    )
+
+    t0 = time.time()
+    for idx in tqdm(range(len(split_df)), desc=f"Building {{split_name}}"):
+        row = split_df.iloc[idx]
+        img = np.array(Image.open(f"{{output_dir}}/{{row['image_path']}}"))
+        actions = np.stack([np.array(a, dtype=np.float32) for a in row["actions"]])
+        actions_flat = actions.flatten()
+        state = np.array([row["speed"], row["heading_rate"]], dtype=np.float32)
+        task = row["nav_prompt"]
+
+        dataset.add_frame({{
+            "observation.images.front": img,
+            "observation.state": state,
+            "action": actions_flat,
+            "task": task,
+        }})
+        dataset.save_episode()
+
+        if (idx + 1) % 5000 == 0:
+            if hasattr(dataset, "image_writer") and dataset.image_writer is not None:
+                dataset.image_writer.wait_until_done()
+            import modal
+            vol = modal.Volume.from_name("pi05-cache")
+            vol.commit()
+            elapsed = time.time() - t0
+            rate = (idx + 1) / elapsed
+            print(f"  Checkpoint: {{idx+1}}/{{len(split_df)}}, {{rate:.1f}} samples/s")
+
+    with open(marker, "w") as f:
+        f.write(f"{{len(split_df)}} samples")
+    import modal
+    vol = modal.Volume.from_name("pi05-cache")
+    vol.commit()
+    print(f"Built {{split_name}}: {{len(split_df)}} samples in {{time.time()-t0:.0f}}s")
+
+print("\\nBUILD COMPLETE")
+''')
+    build_script.flush()
+    script_path = build_script.name
+    build_script.close()
+
+    venv_python = f"{OPENPI_DIR}/.venv/bin/python"
+    print(f"Building LeRobot datasets with {venv_python}")
+    result = subprocess.run(
+        [venv_python, "-u", script_path],
+        text=True,
+        env={**__import__("os").environ, "HF_HOME": f"{CACHE_DIR}/hf", "PYTHONUNBUFFERED": "1"},
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"LeRobot build failed (rc={result.returncode})")
+
+
+# ---------------------------------------------------------------------------
 # Patch openpi with driving config
 # ---------------------------------------------------------------------------
+
+
+def _link_dataset_to_hf_cache(repo_id: str = "markmusic/pi05-physical-av-bc"):
+    """Symlink our local dataset into the HF hub cache so lerobot skips downloads."""
+    import os
+
+    local_dataset = f"{CACHE_DIR}/hf/lerobot/{repo_id}"
+    if not os.path.exists(local_dataset):
+        print(f"No local dataset at {local_dataset}, will download from HF")
+        return
+
+    hub_dir = f"{CACHE_DIR}/hf/hub/datasets--{repo_id.replace('/', '--')}"
+    snapshot_dir = f"{hub_dir}/snapshots/local"
+
+    if os.path.exists(snapshot_dir):
+        print("HF hub cache already linked to local dataset")
+        return
+
+    os.makedirs(f"{hub_dir}/refs", exist_ok=True)
+    os.makedirs(os.path.dirname(snapshot_dir), exist_ok=True)
+
+    with open(f"{hub_dir}/refs/main", "w") as f:
+        f.write("local")
+
+    os.symlink(local_dataset, snapshot_dir)
+
+    cache_volume.commit()
+    print(f"Linked local dataset → HF hub cache (skips HF downloads)")
+
+
+def _consolidate_local_dataset(repo_id: str = "markmusic/pi05-physical-av-bc"):
+    """Merge per-episode parquet files into chunk-level files for fast loading."""
+    import glob
+    import os
+    import shutil
+    import tempfile
+
+    dataset_dir = f"{CACHE_DIR}/hf/lerobot/{repo_id}"
+    data_dir = os.path.join(dataset_dir, "data")
+    marker = os.path.join(dataset_dir, ".consolidated")
+
+    if not os.path.exists(data_dir):
+        print(f"No local dataset at {data_dir}, skipping consolidation")
+        return
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    chunk_dirs = sorted(glob.glob(os.path.join(data_dir, "chunk-*")))
+
+    if os.path.exists(marker):
+        # Already consolidated — just clean up any leftover HF files
+        needs_cleanup = False
+        for chunk_dir in chunk_dirs:
+            if glob.glob(os.path.join(chunk_dir, "file-*.parquet")):
+                needs_cleanup = True
+                break
+        if not needs_cleanup:
+            print("Dataset already consolidated")
+            return
+        print("Cleaning up leftover HF-generated files...")
+    else:
+        print(f"Consolidating {len(chunk_dirs)} chunks (one-time operation)...")
+
+    for chunk_dir in chunk_dirs:
+        episode_files = sorted(glob.glob(os.path.join(chunk_dir, "episode_*.parquet")))
+        if len(episode_files) <= 1:
+            print(f"  {os.path.basename(chunk_dir)}: already consolidated")
+            continue
+
+        print(f"  {os.path.basename(chunk_dir)}: merging {len(episode_files)} files...", end=" ", flush=True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tables = []
+            for f in episode_files:
+                try:
+                    tables.append(pq.read_table(f))
+                except Exception as e:
+                    print(f"\n    WARNING: skipping corrupt file {os.path.basename(f)}: {e}")
+
+            merged = pa.concat_tables(tables)
+            tmp_out = os.path.join(tmpdir, "episode_000000.parquet")
+            pq.write_table(merged, tmp_out)
+
+            for f in episode_files:
+                os.remove(f)
+            shutil.copy2(tmp_out, os.path.join(chunk_dir, "episode_000000.parquet"))
+
+        print(f"{len(merged)} rows", flush=True)
+        cache_volume.commit()
+
+    # Remove HuggingFace auto-generated file-*.parquet files that conflict
+    for chunk_dir in chunk_dirs:
+        for extra in glob.glob(os.path.join(chunk_dir, "file-*.parquet")):
+            print(f"  Removing HF-generated {os.path.basename(chunk_dir)}/{os.path.basename(extra)}")
+            os.remove(extra)
+
+    with open(marker, "w") as f:
+        f.write("done")
+    cache_volume.commit()
+    print("Consolidation complete")
 
 
 def _patch_openpi():
@@ -605,7 +1256,11 @@ class DrivingInputs(transforms.DataTransformFn):
             inputs["actions"] = data["actions"]
 
         if "prompt" in data:
-            inputs["prompt"] = data["prompt"]
+            import random
+            if random.random() < 0.3:
+                inputs["prompt"] = "drive"
+            else:
+                inputs["prompt"] = data["prompt"]
 
         return inputs
 
@@ -693,6 +1348,7 @@ class LeRobotDrivingDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=("action",),
         )
 
 '''
@@ -730,9 +1386,9 @@ class LeRobotDrivingDataConfig(DataConfigFactory):
             action_expert_variant="gemma_300m",
         ).get_freeze_filter(),
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=250,
+            warmup_steps=750,
             peak_lr=3e-5,
-            decay_steps=5_000,
+            decay_steps=15_000,
             decay_lr=3e-6,
         ),
         optimizer=_optimizer.AdamW(
@@ -740,10 +1396,10 @@ class LeRobotDrivingDataConfig(DataConfigFactory):
             b2=0.999,
             clip_gradient_norm=1.0,
         ),
-        num_train_steps=5_000,
+        num_train_steps=15_000,
         batch_size=96,
         fsdp_devices=1,
-        save_interval=250,
+        save_interval=500,
         log_interval=50,
         checkpoint_base_dir="/cache/checkpoints",
     ),
@@ -774,6 +1430,37 @@ class LeRobotDrivingDataConfig(DataConfigFactory):
             with open(lerobot_utils, "w") as f:
                 f.write(content)
             print(f"  Patched version check in {lerobot_utils}")
+
+    # 4b. Patch lerobot to skip downloading data when it already exists locally
+    #     AND skip the file-path assertion (images are embedded in parquet, no separate files).
+    for lerobot_ds in glob.glob(
+        f"{OPENPI_DIR}/.venv/lib/python*/site-packages/lerobot/common/datasets/lerobot_dataset.py"
+    ):
+        with open(lerobot_ds, "r") as f:
+            ds_content = f.read()
+        if "DOWNLOAD_PATCHED" not in ds_content:
+            # Patch 1: skip download when local data exists
+            ds_content = ds_content.replace(
+                "def download_episodes(self",
+                """def download_episodes(self, download_videos=True):  # DOWNLOAD_PATCHED
+        import os as _os
+        _data_dir = _os.path.join(str(self.root), "data")
+        _has_data = _os.path.exists(_data_dir) and len(_os.listdir(_data_dir)) > 0
+        if _has_data:
+            print(f"  DOWNLOAD_PATCHED: local data at {self.root}, skipping HF download")
+            return
+        return self._original_download_episodes(download_videos)
+
+    def _original_download_episodes(self""",
+            )
+            # Patch 2: skip file-path assertion (images embedded in parquet, no separate files)
+            ds_content = ds_content.replace(
+                "assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())",
+                "pass  # DOWNLOAD_PATCHED: images embedded in parquet, no separate files to check",
+            )
+            with open(lerobot_ds, "w") as f:
+                f.write(ds_content)
+            print(f"  Patched lerobot_dataset.py to skip download when local data exists")
 
     # 5. Patch scripts/train.py to handle shape mismatches when loading
     #    base checkpoint with different action_dim (32→2).
@@ -831,7 +1518,7 @@ class LeRobotDrivingDataConfig(DataConfigFactory):
 def main(config: _config.TrainConfig):  # LR_EVAL_PATCHED''',
         )
 
-        # Patch B: Add LR schedule, peval_step, and cached eval batches before training loop
+        # Patch B: Add LR schedule, peval_step, and proper eval from held-out dataset
         content = content.replace(
             "    start_step = int(train_state.step)",
             '''    lr_schedule_fn = config.lr_schedule.create()
@@ -842,10 +1529,25 @@ def main(config: _config.TrainConfig):  # LR_EVAL_PATCHED''',
         out_shardings=replicated_sharding,
     )
 
+    # PROPER EVAL: load held-out eval dataset (not training data)
+    import dataclasses as _dc
+    _eval_repo = data_config.repo_id + "-eval"
     _eval_batches = []
-    for _ in range(5):
-        _eval_batches.append(next(data_iter))
-    logging.info(f"Cached {len(_eval_batches)} batches for eval")
+    try:
+        _eval_dc = _dc.replace(data_config, repo_id=_eval_repo)
+        _eval_loader = _data_loader.get_data_loader(config, _eval_dc, mesh)
+        _eval_iter = iter(_eval_loader)
+        for _ in range(20):
+            try:
+                _eval_batches.append(next(_eval_iter))
+            except StopIteration:
+                break
+        logging.info(f"Loaded {len(_eval_batches)} HELD-OUT eval batches from {_eval_repo}")
+    except Exception as _e:
+        logging.warning(f"Eval dataset not found ({_e}), falling back to train data")
+        for _ in range(5):
+            _eval_batches.append(next(data_iter))
+        logging.info(f"Cached {len(_eval_batches)} train batches as eval (NOT held-out)")
 
     start_step = int(train_state.step)''',
         )
@@ -887,6 +1589,7 @@ def main(config: _config.TrainConfig):  # LR_EVAL_PATCHED''',
     _trigger_dir = _pathlib.Path("/cache/triggers")
 
     infos = []''',
+            1,  # only replace FIRST occurrence (the 4-space one before the for-loop)
         )
 
         content = content.replace(
@@ -917,5 +1620,18 @@ def main(config: _config.TrainConfig):  # LR_EVAL_PATCHED''',
         with open(train_script, "w") as f:
             f.write(content)
         print("  Patched scripts/train.py for trigger-file checkpoint saves")
+
+    # Compile-check the patched train.py to catch syntax/indentation errors early
+    with open(train_script, "r") as f:
+        source = f.read()
+    try:
+        compile(source, train_script, "exec")
+        print("  Compile-check passed for scripts/train.py")
+    except SyntaxError as e:
+        lines = source.split("\n")
+        ctx_start = max(0, e.lineno - 5)
+        ctx_end = min(len(lines), e.lineno + 5)
+        ctx = "\n".join(f"  {i+1:4d}: {lines[i]}" for i in range(ctx_start, ctx_end))
+        raise SyntaxError(f"Patched train.py has syntax error at line {e.lineno}:\n{ctx}") from e
 
     print("openpi patched with driving config")

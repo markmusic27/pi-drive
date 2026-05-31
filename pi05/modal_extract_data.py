@@ -1,13 +1,18 @@
 """Extract PhysicalAI-AV ground truth egomotion for π0.5 BC training.
 
-Step 1: Extract GT egomotion → (accel, curvature) action labels.
-Step 1b: Label navigation intent with Gemini Flash (VLM-based).
-Step 2: Build LeRobot v2 dataset and push to HuggingFace.
+Two-phase pipeline:
+  1. Preload: bulk download dataset to Modal volume (snapshot_download, no rate limits)
+  2. Extract: parallel extraction from local volume (fast, no HF API calls)
 
 Usage:
-    modal run pi05/modal_extract_data.py::extract_parallel --scale large
+    # Phase 1: Bulk download to Modal volume (run once, ~1-2 hours)
+    modal run --detach pi05/modal_extract_data.py::preload_dataset --n-clips 50000
+
+    # Phase 2: Extract from local volume (fast, ~30-60 min with 25 workers)
+    modal run --detach pi05/modal_extract_data.py::extract_parallel --scale xlarge
+
+    # Legacy: direct extraction with HF streaming (slower, rate-limited)
     modal run pi05/modal_extract_data.py::extract_driving_data --scale tiny
-    modal run pi05/modal_extract_data.py::label_nav_prompts --scale tiny
 """
 
 from __future__ import annotations
@@ -61,6 +66,9 @@ label_image = (
 cache_volume = modal.Volume.from_name("pi05-cache", create_if_missing=True)
 VOLUMES = {CACHE_DIR: cache_volume}
 
+DATASET_DIR = f"{CACHE_DIR}/physical_ai_av"
+DATASET_REPO = "nvidia/PhysicalAI-Autonomous-Vehicles"
+
 app = modal.App(APP_NAME)
 
 # ---------------------------------------------------------------------------
@@ -95,6 +103,8 @@ SCALES = {
     "small": 500,
     "medium": 5_000,
     "large": 20_000,
+    "xlarge": 50_000,
+    "full": 163_000,
 }
 
 T0_OFFSETS_US = [
@@ -104,6 +114,144 @@ T0_OFFSETS_US = [
     9_000_000,   # 9s
     11_000_000,  # 11s
 ]
+
+
+# ---------------------------------------------------------------------------
+# Local dataset interface (for preloaded data)
+# ---------------------------------------------------------------------------
+
+
+def _create_local_avdi(local_dir=None):
+    """Create local PAI interface from pre-downloaded dataset on volume."""
+    import os
+    import pandas as pd
+    from alpamayo_r1.data.pai_utils import PhysicalAIAVDatasetLocalInterface
+
+    if local_dir is None:
+        local_dir = DATASET_DIR
+    avdi = PhysicalAIAVDatasetLocalInterface(local_dir=local_dir)
+    avdi.feature_presence = avdi.sensor_presence
+    dc_path = os.path.join(local_dir, "metadata", "data_collection.parquet")
+    if os.path.exists(dc_path):
+        avdi.data_collection = pd.read_parquet(dc_path)
+    return avdi
+
+
+# ---------------------------------------------------------------------------
+# Preload: bulk download PhysicalAI-AV to Modal volume
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=extract_image,
+    volumes=VOLUMES,
+    timeout=60 * 60 * 12,
+    memory=64 * 1024,
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def preload_dataset(n_clips: int = 50_000, seed: int = 42, eval_frac: float = 0.15):
+    """Bulk download PhysicalAI-AV camera + egomotion to Modal volume.
+
+    Uses snapshot_download (git-lfs batch API) which avoids per-file rate limits.
+    After this, extraction reads from local volume — no HF API calls.
+
+    Usage:
+        modal run --detach pi05/modal_extract_data.py::preload_dataset --n-clips 50000
+    """
+    import os
+    import time
+
+    import numpy as np
+    import pandas as pd
+    from huggingface_hub import snapshot_download
+
+    t_start = time.time()
+
+    # Step 1: Download metadata (small, fast)
+    print("=== Step 1: Downloading metadata ===")
+    snapshot_download(
+        DATASET_REPO,
+        repo_type="dataset",
+        allow_patterns=["features.csv", "clip_index.parquet", "metadata/**"],
+        local_dir=DATASET_DIR,
+        local_dir_use_symlinks=False,
+    )
+    cache_volume.commit()
+    print(f"  Metadata downloaded in {time.time() - t_start:.0f}s")
+
+    # Step 2: Filter clips and identify needed chunks
+    print("=== Step 2: Filtering clips ===")
+    avdi = _create_local_avdi()
+    filtered = _filter_clips(avdi)
+    print(f"  {len(filtered)} clips pass filters")
+
+    rng = np.random.default_rng(seed)
+    if len(filtered) > n_clips:
+        selected = rng.choice(filtered, size=n_clips, replace=False).tolist()
+    else:
+        selected = list(filtered)
+    rng.shuffle(selected)
+
+    # Train/eval split at clip level
+    n_eval = max(1, int(len(selected) * eval_frac))
+    eval_clips = selected[:n_eval]
+    train_clips = selected[n_eval:]
+    print(f"  Selected {len(selected)} clips: {len(train_clips)} train, {n_eval} eval")
+
+    # Find needed chunks
+    chunk_ids = set()
+    for clip_id in selected:
+        try:
+            chunk_val = avdi.clip_index.at[clip_id, "chunk"]
+            if isinstance(chunk_val, str):
+                chunk_ids.add(int(chunk_val.replace("chunk_", "").replace("chunk", "")))
+            else:
+                chunk_ids.add(int(chunk_val))
+        except (KeyError, ValueError):
+            pass
+    print(f"  Clips span {len(chunk_ids)} chunks")
+
+    # Save clip lists for extraction
+    preload_dir = f"{CACHE_DIR}/preload"
+    os.makedirs(preload_dir, exist_ok=True)
+    pd.DataFrame({"clip_id": selected}).to_parquet(f"{preload_dir}/selected_clips.parquet")
+    pd.DataFrame({"clip_id": eval_clips}).to_parquet(f"{preload_dir}/eval_clips.parquet")
+    cache_volume.commit()
+
+    # Step 3: Download camera + egomotion chunks
+    print(f"=== Step 3: Downloading {len(chunk_ids)} chunks (camera + egomotion) ===")
+    patterns = ["features.csv", "clip_index.parquet", "metadata/**"]
+    for cid in sorted(chunk_ids):
+        cs = f"chunk_{cid:04d}"
+        patterns.append(f"camera/camera_front_wide_120fov/camera_front_wide_120fov.{cs}.*")
+        patterns.append(f"labels/egomotion/egomotion.{cs}.*")
+
+    print(f"  {len(patterns)} patterns total, downloading...")
+    snapshot_download(
+        DATASET_REPO,
+        repo_type="dataset",
+        allow_patterns=patterns,
+        local_dir=DATASET_DIR,
+        local_dir_use_symlinks=False,
+    )
+
+    # Verify download
+    cam_dir = os.path.join(DATASET_DIR, "camera", "camera_front_wide_120fov")
+    ego_dir = os.path.join(DATASET_DIR, "labels", "egomotion")
+    n_cam = len(os.listdir(cam_dir)) if os.path.isdir(cam_dir) else 0
+    n_ego = len(os.listdir(ego_dir)) if os.path.isdir(ego_dir) else 0
+    print(f"  Downloaded: {n_cam} camera files, {n_ego} egomotion files")
+
+    with open(f"{preload_dir}/done", "w") as f:
+        f.write(f"{len(selected)} clips, {len(chunk_ids)} chunks\n")
+        f.write(f"train: {len(train_clips)}, eval: {n_eval}\n")
+
+    cache_volume.commit()
+    elapsed = time.time() - t_start
+    print(f"\n=== Preload complete in {elapsed/60:.1f} min ===")
+    print(f"  {len(selected)} clips across {len(chunk_ids)} chunks")
+    print(f"  Run extraction next: modal run --detach pi05/modal_extract_data.py::extract_parallel --scale xlarge")
+    return len(selected)
 
 
 # ---------------------------------------------------------------------------
@@ -342,23 +490,22 @@ def _process_clips(clip_ids, eval_clip_set, scale, avdi=None):
 @app.function(
     image=extract_image,
     volumes=VOLUMES,
-    gpu="T4",
     timeout=60 * 60 * 2,
     memory=32 * 1024,
     secrets=[modal.Secret.from_name("huggingface")],
-    max_containers=3,
+    max_containers=25,
 )
 def _extract_clip_batch(
     clip_ids: list[str],
     eval_clip_ids: list[str],
     scale: str,
     batch_idx: int,
+    preloaded: bool = False,
 ) -> dict:
     """Process a batch of clips. Called in parallel by extract_parallel.
 
-    Uses a LOCAL HF cache (copied from shared volume metadata) so that
-    429 error responses from HuggingFace never poison the shared cache.
-    Only extracted images are written to the shared volume.
+    If preloaded=True, reads from local volume (fast, no HF API calls).
+    Otherwise uses a local HF cache to avoid 429 corruption.
     """
     import os
     import shutil
@@ -366,46 +513,40 @@ def _extract_clip_batch(
     import time
     from collections import Counter
 
-    # --- LOCAL HF CACHE ---
-    # Copy pre-cached metadata from shared volume to a local temp dir.
-    # Workers download clip data into this local dir (ephemeral, per-container).
-    # This prevents 429 error pages from corrupting the shared volume cache.
-    local_hf = tempfile.mkdtemp(prefix="hf_local_")
-    shared_hf = f"{CACHE_DIR}/hf"
-
-    if os.path.isdir(shared_hf):
-        # Selectively copy: only non-zip files (metadata CSVs, parquets, configs).
-        # Skip zip/blob files to keep the copy fast.
-        shared_hub = os.path.join(shared_hf, "hub")
-        if os.path.isdir(shared_hub):
-            n_copied = 0
-            for dirpath, dirnames, filenames in os.walk(shared_hub):
-                for fname in filenames:
-                    if fname.endswith(".zip"):
-                        continue
-                    src = os.path.join(dirpath, fname)
-                    rel = os.path.relpath(src, shared_hf)
-                    dst = os.path.join(local_hf, rel)
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    shutil.copy2(src, dst)
-                    n_copied += 1
-            print(f"Batch {batch_idx}: copied {n_copied} metadata files to local HF dir")
-        else:
-            print(f"Batch {batch_idx}: no shared hub cache found, starting fresh")
+    if preloaded:
+        # Data pre-downloaded to volume — read locally, no HF API calls
+        avdi = _create_local_avdi()
+        print(f"Batch {batch_idx}: using preloaded local data ({len(clip_ids)} clips)")
     else:
-        print(f"Batch {batch_idx}: no shared HF dir found, starting fresh")
-
-    os.environ["HF_HOME"] = local_hf
+        # Original: local HF cache to avoid 429 corruption
+        local_hf = tempfile.mkdtemp(prefix="hf_local_")
+        shared_hf = f"{CACHE_DIR}/hf"
+        if os.path.isdir(shared_hf):
+            shared_hub = os.path.join(shared_hf, "hub")
+            if os.path.isdir(shared_hub):
+                n_copied = 0
+                for dirpath, dirnames, filenames in os.walk(shared_hub):
+                    for fname in filenames:
+                        if fname.endswith(".zip"):
+                            continue
+                        src = os.path.join(dirpath, fname)
+                        rel = os.path.relpath(src, shared_hf)
+                        dst = os.path.join(local_hf, rel)
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        shutil.copy2(src, dst)
+                        n_copied += 1
+                print(f"Batch {batch_idx}: copied {n_copied} metadata files to local HF dir")
+        os.environ["HF_HOME"] = local_hf
+        avdi = None
 
     t0 = time.time()
     eval_set = set(eval_clip_ids)
-    samples, errors = _process_clips(clip_ids, eval_set, scale)
+    samples, errors = _process_clips(clip_ids, eval_set, scale, avdi=avdi)
 
-    # Only commit the shared volume (images written to CACHE_DIR/extracted/)
     cache_volume.commit()
 
-    # Clean up local HF cache (container-local, ephemeral)
-    shutil.rmtree(local_hf, ignore_errors=True)
+    if not preloaded:
+        shutil.rmtree(local_hf, ignore_errors=True)
 
     elapsed = time.time() - t0
     rate = len(clip_ids) / elapsed if elapsed > 0 else 0
@@ -428,7 +569,6 @@ def _extract_clip_batch(
 @app.function(
     image=extract_image,
     volumes=VOLUMES,
-    gpu="T4",
     timeout=60 * 60 * 12,
     memory=32 * 1024,
     secrets=[modal.Secret.from_name("huggingface")],
@@ -436,36 +576,49 @@ def _extract_clip_batch(
 def extract_parallel(
     scale: str = "large",
     seed: int = 42,
-    eval_frac: float = 0.1,
-    batch_size: int = 200,
+    eval_frac: float = 0.15,
+    batch_size: int = 80,
 ):
-    """Parallel extraction across many Modal containers."""
+    """Parallel extraction across many Modal containers.
+
+    If preload_dataset was run first, reads from local volume (fast).
+    Otherwise falls back to HF streaming (slower, rate-limited).
+    """
     import os
     import time
 
     import numpy as np
     import pandas as pd
-    import physical_ai_av
 
     max_clips = SCALES[scale]
-    print(f"=== Parallel extraction: {scale} scale, {max_clips} clips ===")
+    preload_dir = f"{CACHE_DIR}/preload"
+    preloaded = os.path.exists(f"{preload_dir}/done")
 
-    avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
-    print(f"Dataset: {len(avdi.clip_index)} total clips")
-
-    available_clips = _filter_clips(avdi)
-    print(f"Available after filtering: {len(available_clips)} clips")
-
-    rng = np.random.default_rng(seed)
-    if len(available_clips) > max_clips:
-        selected_clips = rng.choice(available_clips, size=max_clips, replace=False).tolist()
+    if preloaded:
+        print(f"=== Parallel extraction: {scale} scale, PRELOADED data ===")
+        avdi = _create_local_avdi()
+        clip_df = pd.read_parquet(f"{preload_dir}/selected_clips.parquet")
+        selected_clips = clip_df["clip_id"].tolist()
+        eval_df = pd.read_parquet(f"{preload_dir}/eval_clips.parquet")
+        eval_clips = eval_df["clip_id"].tolist()
+        print(f"Using {len(selected_clips)} preloaded clips ({len(eval_clips)} eval)")
     else:
-        selected_clips = available_clips[:max_clips]
+        print(f"=== Parallel extraction: {scale} scale, {max_clips} clips (HF streaming) ===")
+        import physical_ai_av
+        avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
+        print(f"Dataset: {len(avdi.clip_index)} total clips")
+        available_clips = _filter_clips(avdi)
+        print(f"Available after filtering: {len(available_clips)} clips")
+        rng = np.random.default_rng(seed)
+        if len(available_clips) > max_clips:
+            selected_clips = rng.choice(available_clips, size=max_clips, replace=False).tolist()
+        else:
+            selected_clips = available_clips[:max_clips]
+        n_eval = max(1, int(len(selected_clips) * eval_frac))
+        rng.shuffle(selected_clips)
+        eval_clips = selected_clips[:n_eval]
 
-    n_eval = max(1, int(len(selected_clips) * eval_frac))
-    rng.shuffle(selected_clips)
-    eval_clips = selected_clips[:n_eval]
-    print(f"Selected {len(selected_clips)} clips: {len(selected_clips) - n_eval} train, {n_eval} eval")
+    print(f"Selected {len(selected_clips)} clips: {len(selected_clips) - len(eval_clips)} train, {len(eval_clips)} eval")
 
     output_dir = f"{CACHE_DIR}/extracted/{scale}"
     os.makedirs(output_dir, exist_ok=True)
@@ -516,6 +669,7 @@ def extract_parallel(
         [eval_clips] * n_batches,
         [scale] * n_batches,
         list(range(n_batches)),
+        [preloaded] * n_batches,
     ):
         all_samples.extend(r["samples"])
         all_errors.extend(r["errors"])
