@@ -145,15 +145,52 @@ def _create_local_avdi(local_dir=None):
 @app.function(
     image=extract_image,
     volumes=VOLUMES,
-    timeout=60 * 60 * 12,
+    timeout=60 * 60 * 4,
+    memory=32 * 1024,
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def _download_chunk_batch(chunk_ids_list: list[int], batch_idx: int) -> dict:
+    """Download a batch of chunks to the shared volume. Called in parallel by preload_dataset."""
+    import os
+    import time
+
+    from huggingface_hub import snapshot_download
+
+    t0 = time.time()
+    patterns = []
+    for cid in chunk_ids_list:
+        cs = f"chunk_{cid:04d}"
+        patterns.append(f"camera/camera_front_wide_120fov/camera_front_wide_120fov.{cs}.*")
+        patterns.append(f"labels/egomotion/egomotion.{cs}.*")
+
+    print(f"[Worker {batch_idx}] Downloading {len(chunk_ids_list)} chunks ({len(patterns)} files)...")
+    snapshot_download(
+        DATASET_REPO,
+        repo_type="dataset",
+        allow_patterns=patterns,
+        local_dir=DATASET_DIR,
+        local_dir_use_symlinks=False,
+    )
+    cache_volume.commit()
+
+    elapsed = time.time() - t0
+    print(f"[Worker {batch_idx}] Done — {len(chunk_ids_list)} chunks in {elapsed/60:.1f} min")
+    return {"batch_idx": batch_idx, "n_chunks": len(chunk_ids_list), "elapsed": elapsed}
+
+
+@app.function(
+    image=extract_image,
+    volumes=VOLUMES,
+    timeout=60 * 60 * 6,
     memory=64 * 1024,
     secrets=[modal.Secret.from_name("huggingface")],
 )
-def preload_dataset(n_clips: int = 50_000, seed: int = 42, eval_frac: float = 0.15):
+def preload_dataset(n_clips: int = 50_000, seed: int = 42, eval_frac: float = 0.15,
+                    n_workers: int = 10, chunks_per_worker: int = 280):
     """Bulk download PhysicalAI-AV camera + egomotion to Modal volume.
 
-    Uses snapshot_download (git-lfs batch API) which avoids per-file rate limits.
-    After this, extraction reads from local volume — no HF API calls.
+    Parallelizes across n_workers Modal containers, each downloading a batch of chunks.
+    Each worker commits to the volume independently so progress is never lost.
 
     Usage:
         modal run --detach pi05/modal_extract_data.py::preload_dataset --n-clips 50000
@@ -218,29 +255,27 @@ def preload_dataset(n_clips: int = 50_000, seed: int = 42, eval_frac: float = 0.
     pd.DataFrame({"clip_id": eval_clips}).to_parquet(f"{preload_dir}/eval_clips.parquet")
     cache_volume.commit()
 
-    # Step 3: Download camera + egomotion chunks
-    print(f"=== Step 3: Downloading {len(chunk_ids)} chunks (camera + egomotion) ===")
-    patterns = ["features.csv", "clip_index.parquet", "metadata/**"]
-    for cid in sorted(chunk_ids):
-        cs = f"chunk_{cid:04d}"
-        patterns.append(f"camera/camera_front_wide_120fov/camera_front_wide_120fov.{cs}.*")
-        patterns.append(f"labels/egomotion/egomotion.{cs}.*")
+    # Step 3: Parallel download across workers
+    chunk_list = sorted(chunk_ids)
+    batches = [chunk_list[i:i + chunks_per_worker]
+               for i in range(0, len(chunk_list), chunks_per_worker)]
+    print(f"=== Step 3: Downloading {len(chunk_ids)} chunks across {len(batches)} workers ===")
 
-    print(f"  {len(patterns)} patterns total, downloading...")
-    snapshot_download(
-        DATASET_REPO,
-        repo_type="dataset",
-        allow_patterns=patterns,
-        local_dir=DATASET_DIR,
-        local_dir_use_symlinks=False,
-    )
+    results = list(_download_chunk_batch.map(
+        batches,
+        list(range(len(batches))),
+    ))
+
+    total_chunks = sum(r["n_chunks"] for r in results)
+    print(f"  All workers done — {total_chunks} chunks downloaded")
 
     # Verify download
+    cache_volume.reload()
     cam_dir = os.path.join(DATASET_DIR, "camera", "camera_front_wide_120fov")
     ego_dir = os.path.join(DATASET_DIR, "labels", "egomotion")
     n_cam = len(os.listdir(cam_dir)) if os.path.isdir(cam_dir) else 0
     n_ego = len(os.listdir(ego_dir)) if os.path.isdir(ego_dir) else 0
-    print(f"  Downloaded: {n_cam} camera files, {n_ego} egomotion files")
+    print(f"  Verified: {n_cam} camera files, {n_ego} egomotion files")
 
     with open(f"{preload_dir}/done", "w") as f:
         f.write(f"{len(selected)} clips, {len(chunk_ids)} chunks\n")
